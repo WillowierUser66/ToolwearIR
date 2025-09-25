@@ -1,6 +1,7 @@
-# IR_ToolWearapp_threshold_only.py
-# Purpose: Display Lepton thermal video, detect a single ROI using a binary threshold,
-#          plot average and max temperatures over time, and optionally save metrics to CSV.
+# IR_ToolWearapp_masked_threshold.py
+# Purpose: Display Lepton thermal video, let the user define a rectangular mask by drag-and-drop
+#          on the live view, then run a relatively high fixed threshold ONLY inside that mask to
+#          trace edges (contours). Plots average and max ROI temperatures over time and can save CSV.
 
 import sys
 import os
@@ -24,8 +25,9 @@ import matplotlib.pyplot as plt
 # =========================
 # Configuration constants
 # =========================
-SCALE_PERCENT = 200                     # Display upscaling for the thermal frame in percent
-FRAME_DELAY_MS = int(1000 / 60)         # About 60 FPS UI update target
+SCALE_PERCENT = 200                      # Display upscaling for the thermal frame in percent
+FRAME_DELAY_MS = int(1000 / 60)          # About 60 FPS UI update target
+THRESH_8U = 110                          # Relatively high 8-bit threshold applied within mask only
 
 # Camera temperature ranges in centikelvin exposed via dropdown
 TEMP_RANGES = {
@@ -58,7 +60,7 @@ lep = found_device.Open()
 # Use LOW gain for a wider temperature span
 lep.sys.SetGainMode(CCI.Sys.GainMode.LOW)
 
-# IR16 capture graph with Python callback that receives 16 bit frames
+# IR16 capture graph with Python callback that receives 16-bit frames
 clr.AddReference("ManagedIR16Filters")
 from IR16Filters import IR16Capture, NewBytesFrameEvent
 
@@ -77,7 +79,7 @@ time.sleep(3)  # give the graph a moment to warm up before UI starts
 # Utility functions
 # =========================
 def short_array_to_numpy(height, width, frame_iterable):
-    """Convert incoming 16 bit centikelvin buffer to a (H, W) uint16 NumPy array."""
+    """Convert incoming 16-bit centikelvin buffer to a (H, W) uint16 NumPy array."""
     return np.fromiter(frame_iterable, dtype=np.uint16).reshape(height, width)
 
 def centikelvin_to_celsius(t_ck):
@@ -90,16 +92,23 @@ def centikelvin_to_celsius(t_ck):
 class ThermalVideoApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Thermal Camera Viewer – Threshold ROI Plot and CSV")
+        self.root.title("Thermal Camera Viewer – Masked Threshold ROI")
         self.root.protocol("WM_DELETE_WINDOW", self.quit_app)
 
         # App state
         self.running = True
+        self.suspend_video = False       # Suspends redraw while drawing the mask
         self.recording = False
         self.recording_start_time = None
         self.stream_start_time = time.time()
         self.data_records = []           # rows: [elapsed_s, avg_temp_C, max_temp_C, roi_area_px2]
         self.after_id = None
+
+        # Mask drawing state
+        self.user_mask = None            # np.uint8 mask same size as display (0 outside, 1 inside)
+        self.mask_bounds = None          # (x0, y0, x1, y1) for overlay drawing
+        self._drag_start = None          # (x, y) start of drag on canvas
+        self._rubberband_id = None       # Canvas rectangle id during drawing
 
         # Canvas for thermal image
         self.canvas = tk.Canvas(root)
@@ -115,6 +124,9 @@ class ThermalVideoApp:
         self.widthScaled  = int(preview.shape[1] * SCALE_PERCENT / 100)
         self.heightScaled = int(preview.shape[0] * SCALE_PERCENT / 100)
         self.dim = (self.widthScaled, self.heightScaled)
+
+        # Initialize empty mask sized to display
+        self.user_mask = np.zeros((self.heightScaled, self.widthScaled), np.uint8)
 
         # Plots for Average and Maximum ROI Temperature
         self.time_data, self.avg_series, self.max_series = [], [], []
@@ -145,6 +157,8 @@ class ThermalVideoApp:
         control_frame = ttk.Frame(root)
         control_frame.grid(row=2, column=0, columnspan=2, pady=5)
 
+        ttk.Button(control_frame, text="Define Mask", command=self.enable_mask_draw).pack(side="left", padx=5)
+        ttk.Button(control_frame, text="Clear Mask", command=self.clear_mask).pack(side="left", padx=5)
         ttk.Button(control_frame, text="Start Recording", command=self.start_recording).pack(side="left", padx=5)
         ttk.Button(control_frame, text="Stop and Save CSV", command=self.stop_recording).pack(side="left", padx=5)
         ttk.Button(control_frame, text="Quit", command=self.quit_app).pack(side="left", padx=5)
@@ -163,13 +177,77 @@ class ThermalVideoApp:
         self.temp_range_dropdown.bind("<<ComboboxSelected>>", self.change_temp_range)
         self.change_temp_range()  # initialize device span
 
-        # Threshold slider used by the ROI detector
-        self.threshold_value = tk.IntVar(value=150)
-        ttk.Label(control_frame, text="Threshold:").pack(side="left", padx=5)
-        ttk.Scale(control_frame, from_=0, to=255, orient="horizontal", variable=self.threshold_value).pack(side="left", padx=5)
-
         # Start UI loop
         self.update_video()
+
+    # -------------------------
+    # Mask drawing handlers
+    # -------------------------
+    def enable_mask_draw(self):
+        """Enable click-and-drag rectangle drawing on the video to define a mask."""
+        self.suspend_video = True  # pause the regular redraw to avoid flicker while drawing
+        # Bind mouse events on the canvas
+        self.canvas.bind("<ButtonPress-1>", self._on_mask_start)
+        self.canvas.bind("<B1-Motion>", self._on_mask_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._on_mask_release)
+
+    def _on_mask_start(self, event):
+        self._drag_start = (self._clamp_x(event.x), self._clamp_y(event.y))
+        # Remove any previous rubberband rectangle
+        if self._rubberband_id is not None:
+            self.canvas.delete(self._rubberband_id)
+            self._rubberband_id = None
+
+    def _on_mask_drag(self, event):
+        if not self._drag_start:
+            return
+        x0, y0 = self._drag_start
+        x1, y1 = self._clamp_x(event.x), self._clamp_y(event.y)
+        # Draw or update a rubberband rectangle overlay while dragging
+        if self._rubberband_id is None:
+            self._rubberband_id = self.canvas.create_rectangle(
+                x0, y0, x1, y1, outline="yellow", width=2, dash=(4, 3)
+            )
+        else:
+            self.canvas.coords(self._rubberband_id, x0, y0, x1, y1)
+
+    def _on_mask_release(self, event):
+        if not self._drag_start:
+            return
+        x0, y0 = self._drag_start
+        x1, y1 = self._clamp_x(event.x), self._clamp_y(event.y)
+        self._drag_start = None
+
+        # Normalize coords to top-left -> bottom-right
+        xL, xR = sorted((x0, x1))
+        yT, yB = sorted((y0, y1))
+
+        # Build binary mask (1 inside rect, 0 outside)
+        self.user_mask.fill(0)
+        self.user_mask[yT:yB, xL:xR] = 1
+        self.mask_bounds = (xL, yT, xR, yB)
+
+        # Remove temporary rubberband
+        if self._rubberband_id is not None:
+            self.canvas.delete(self._rubberband_id)
+            self._rubberband_id = None
+
+        # Unbind drawing handlers and resume video updates
+        self.canvas.unbind("<ButtonPress-1>")
+        self.canvas.unbind("<B1-Motion>")
+        self.canvas.unbind("<ButtonRelease-1>")
+        self.suspend_video = False
+
+    def clear_mask(self):
+        """Clear the user-defined mask so no region is selected."""
+        self.user_mask.fill(0)
+        self.mask_bounds = None
+
+    def _clamp_x(self, x):
+        return max(0, min(self.widthScaled - 1, x))
+
+    def _clamp_y(self, y):
+        return max(0, min(self.heightScaled - 1, y))
 
     # -------------------------
     # Device span change
@@ -189,8 +267,12 @@ class ThermalVideoApp:
     # Frame processing loop
     # -------------------------
     def update_video(self):
-        """Fetch frame, detect ROI with threshold, update plots and optionally record metrics."""
+        """Fetch frame, threshold only within user mask, update plots, optionally record metrics."""
+        # If drawing mask, skip frame redraw but keep scheduling
         if not self.running:
+            return
+        if self.suspend_video:
+            self.after_id = self.root.after(FRAME_DELAY_MS, self.update_video)
             return
 
         # Acquire latest frame or a black placeholder
@@ -200,25 +282,42 @@ class ThermalVideoApp:
             # Resize first in CK to minimize rounding, then convert to Celsius
             arr_ck_resized = cv.resize(arr_ck, self.dim, interpolation=cv.INTER_NEAREST)
             arr_c = centikelvin_to_celsius(arr_ck_resized).astype(np.float32)
-            # Build visualization for humans
+            # Build visualization for humans (note: normalized per-frame)
             vis_8u = cv.normalize(arr_c, None, 0, 255, cv.NORM_MINMAX, cv.CV_8U)
             frame_bgr = cv.applyColorMap(vis_8u, cv.COLORMAP_PLASMA)
         else:
             frame_bgr = np.zeros((self.heightScaled, self.widthScaled, 3), np.uint8)
             arr_c = np.zeros((self.heightScaled, self.widthScaled), dtype=np.float32)
+            vis_8u = np.zeros((self.heightScaled, self.widthScaled), dtype=np.uint8)
 
-        # ROI detection using a single threshold method
+        # ----------------------------------------
+        # Thresholding restricted to user-defined mask
+        # ----------------------------------------
         gray = cv.cvtColor(frame_bgr, cv.COLOR_BGR2GRAY)
-        kernel = cv.getStructuringElement(cv.MORPH_RECT, (5, 5))
 
-        blur = cv.GaussianBlur(gray, (5, 5), 0)
-        _, thresh = cv.threshold(blur, int(self.threshold_value.get()), 255, cv.THRESH_BINARY)
+        # If no mask defined, do nothing (no ROI). Otherwise apply threshold within mask only.
+        contours = []
+        if self.user_mask is not None and np.any(self.user_mask):
+            # Zero-out pixels outside the mask to guarantee no detections there
+            masked_gray = gray.copy()
+            masked_gray[self.user_mask == 0] = 0
 
-        # Clean small artifacts while preserving shapes
-        thresh = cv.morphologyEx(thresh, cv.MORPH_OPEN, kernel)
-        thresh = cv.morphologyEx(thresh, cv.MORPH_CLOSE, kernel)
+            # Light blur to reduce salt-and-pepper
+            blur = cv.GaussianBlur(masked_gray, (5, 5), 0)
 
-        contours, _ = cv.findContours(thresh, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
+            # Fixed "relatively high" threshold on 8-bit normalized image
+            _, thresh = cv.threshold(blur, THRESH_8U, 255, cv.THRESH_BINARY)
+
+            # Clean small artifacts while preserving shapes
+            kernel = cv.getStructuringElement(cv.MORPH_RECT, (5, 5))
+            thresh = cv.morphologyEx(thresh, cv.MORPH_OPEN, kernel)
+            thresh = cv.morphologyEx(thresh, cv.MORPH_CLOSE, kernel)
+
+            contours, _ = cv.findContours(thresh, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
+
+            # Optional: visualize the masked area subtly (dark overlay outside mask)
+            outside = (self.user_mask == 0)
+            frame_bgr[outside] = (frame_bgr[outside] * 0.4).astype(np.uint8)
 
         # Build a mask from the largest detected region if any
         mask = np.zeros((self.heightScaled, self.widthScaled), np.uint8)
@@ -266,13 +365,18 @@ class ThermalVideoApp:
         self.ax_max.set_ylim(ymin_m - pad_m, ymax_m + pad_m)
         self.canvas_max.draw()
 
-        # Draw RGB image on Tk canvas
+        # Draw image on Tk canvas
         rgb = cv.cvtColor(frame_bgr, cv.COLOR_BGR2RGB)
         imgtk = ImageTk.PhotoImage(Image.fromarray(rgb))
         self.canvas.delete("all")
         self.canvas.config(width=self.widthScaled, height=self.heightScaled)
         self.canvas.create_image(0, 0, anchor=tk.NW, image=imgtk)
         self.canvas.imgtk = imgtk  # keep reference to avoid GC
+
+        # Draw persistent mask rectangle outline (if any) over the frame
+        if self.mask_bounds is not None:
+            xL, yT, xR, yB = self.mask_bounds
+            self.canvas.create_rectangle(xL, yT, xR, yB, outline="yellow", width=2)
 
         # Schedule next frame
         self.after_id = self.root.after(FRAME_DELAY_MS, self.update_video)
