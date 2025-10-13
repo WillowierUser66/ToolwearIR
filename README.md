@@ -11,16 +11,23 @@ The Lepton FLIR camera was chosen for this project since it is a low-cost, opens
 The code produces an application using the [Tkinter](https://docs.python.org/3/library/tkinter.html) library which streams the IR image gathere from the Lepton FLIR 3.5 camera. A mask can be traced on top of the stream widget, this is intended to tell the edge detection algorithm where to detect the edges for the region of interest, the edge detection is done via the [OpenCV](https://opencv.org/) library. The average and maximum temperature are recorded over time once the "Start Recoding" button is press, the area of the ROI is also recorded since in literature it is mentioned that the temperature distribution along the endmill is an indicator of tool wear [Citation pending]. A vertical line can also be traced, the purpose of the vertical line is to create 5 horizontal lines that act as ROIs and have the purpose of indicating the temperature distribution along the endmill. When the "Stop Recording" button is pressed then the app lets you save all the data into a CSV file. The lines are "upside down" because the camera was mounted that way in my project so the base of the endmill would be at the "top" of the image. 
 
 ## Installation Instructions
-To intall the program is simple, just **clone** this git and follow the instructions from the **Jupyter** file inside the **Examples** directory but there are some recommendations that I have to make. First, the code is based on Python 3.13, so I would recommend sticking to this version. Then, I have had problems with the **dlls** so I would strognly recommend creating a virtual environment for the application. Then is just a matter of installing the necessary libraries not described in the jupyter file such as Tkinter and OpenCV. If a virtual enviroment was created please make sure to install the libraries inside the environment. Usually Tkinter is already included in Python 3 by default but you can check using:
->Check if Tkinter is included
->
->>``python -m tkinter``
+To intall the program is simple, just **clone** this git and follow the instructions from the **Jupyter** file inside the **Examples** directory but there are some recommendations that I have to make. First, the code is based on Python 3.13, so I would recommend sticking to this version. Then, I have had problems with the **dlls** so I would strognly recommend creating a virtual environment for the application. Then is just a matter of installing the necessary libraries not described in the jupyter file such as Tkinter and OpenCV. If a virtual enviroment was created please make sure to install the libraries inside the environment. Usually Tkinter is already included in Python 3 by default but you can check in your terminal using:
+```
+python -m tkinter
+```
+To install OpenCV just run in your terminal:
+```
+pip install opencv-python
+```
+## Contributions
+If you want to contribute to the code you can create your own branch just send me a message at juanp.gchavira@gmail.com to talk and know what are you planning to do with this code. Ofcourse if you're planning on using this code in your research, please cite my work. Don't be afraid to reach out and give me any feedback or suggestion I can also answer questions. It would be cool to use this code to gather enough data to build a machine learning model to predict tool wear using temperature, If you're also interested in that pleae reach out. 
 
 ## References 
 [1]  
 [2]  
 [3] J. A. Ramirez-Nunez, M. Trejo-Hernandez, R. J. Romero-Troncoso, G. Herrera-Ruiz, and R. A. Osornio-Rios, “Smart-sensor for tool-breakage detection in milling process under dry and wet conditions based on infrared thermography,” Int. J. Adv. Manuf. Technol., vol. 97, no. 5, Art. no. 5, July 2018, [doi: 10.1007/s00170-018-2060-4](https://link.springer.com/article/10.1007/s00170-018-2060-4)  
 [4]
+
 
 
 
