@@ -1,6 +1,3 @@
-# IR_ToolWearapp_masked_threshold_vline_hlines_rois_v5.py
-# Adds a 5th horizontal ROI located at the bottom endpoint of the vertical line.
-
 import sys, os, time, platform
 from collections import deque
 import cv2 as cv
