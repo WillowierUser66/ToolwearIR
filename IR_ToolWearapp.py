@@ -232,11 +232,12 @@ class ThermalVideoApp:
         """
         Returns y positions for 5 horizontal lines:
         - 1/5, 2/5, 3/5, 4/5 along the vertical segment
-        - plus a 5th at the bottom endpoint of the segment
+        - plus a 5th at the TOP endpoint of the segment   <-- moved here
         Also returns (x_left, x_right) for the 20 px span centered at vertical x.
         """
         if self.vline_coords is None:
             return [], None, None
+
         x0, y0, y1 = self.vline_coords
         y_top, y_bot = (y0, y1) if y0 <= y1 else (y1, y0)
         seg_len = y_bot - y_top
@@ -247,13 +248,15 @@ class ThermalVideoApp:
         for k in (1, 2, 3, 4):
             yk = int(round(y_top + k * seg_len / 5.0))
             ys.append(yk)
-        ys.append(int(y_bot))  # 5th line at the bottom endpoint
+
+        # Previously used y_bot (bottom). Now place the 5th line at the TOP endpoint.
+        ys.append(int(y_top))  # 5th line at the top endpoint
 
         # Clamp to canvas bounds
         ys = [max(0, min(self.heightScaled - 1, yk)) for yk in ys]
 
-        half_len = 10
-        x_left  = max(0, x0 - half_len)
+        half_len = 10  # total 20 px line length
+        x_left = max(0, x0 - half_len)
         x_right = min(self.widthScaled - 1, x0 + half_len)
         return ys, x_left, x_right
 
