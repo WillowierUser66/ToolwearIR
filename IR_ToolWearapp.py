@@ -1,7 +1,5 @@
-# IR_ToolWearapp_masked_threshold_vline.py
-# Purpose: Live Lepton thermal view with user-defined rectangular mask;
-#          high fixed threshold applied ONLY within mask to find ROI;
-#          avg/max ROI temps plotted; CSV logging; vertical line measurement.
+# IR_ToolWearapp_masked_threshold_vline_hlines_rois_v5.py
+# Adds a 5th horizontal ROI located at the bottom endpoint of the vertical line.
 
 import sys, os, time, platform
 from collections import deque
@@ -15,23 +13,15 @@ from PIL import Image, ImageTk
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import matplotlib.pyplot as plt
 
-# =========================
-# Configuration
-# =========================
-SCALE_PERCENT   = 200           # Display upscaling for the thermal frame (percent)
-FRAME_DELAY_MS  = int(1000/60)  # ~60 FPS UI update target
+SCALE_PERCENT   = 200
+FRAME_DELAY_MS  = int(1000/60)
 THRESH_8U       = 110
-# Relatively high 8-bit threshold (applied only inside user mask)
 
-# Camera temperature ranges (centikelvin) exposed via dropdown
 TEMP_RANGES = {
     "Low (-10°C to 140°C)":  (27315 - 10 * 100,  27315 + 140 * 100),
     "High (-10°C to 400°C)": (27315 - 10 * 100,  27315 + 400 * 100),
 }
 
-# =========================
-# COM & Lepton SDK init
-# =========================
 CoInitialize()
 bits, _ = platform.architecture()
 sys.path.append(os.path.join("", "x64" if bits == "64bit" else "x86"))
@@ -46,7 +36,7 @@ if not found_device:
     sys.exit(1)
 
 lep = found_device.Open()
-lep.sys.SetGainMode(CCI.Sys.GainMode.LOW)  # LOW gain for wider span
+lep.sys.SetGainMode(CCI.Sys.GainMode.LOW)
 
 clr.AddReference("ManagedIR16Filters")
 from IR16Filters import IR16Capture, NewBytesFrameEvent
@@ -54,60 +44,47 @@ from IR16Filters import IR16Capture, NewBytesFrameEvent
 incoming_frames = deque(maxlen=10)
 
 def got_a_frame(frame, width, height):
-    """Capture callback: store frames as (h, w, iterable_of_uint16)."""
     incoming_frames.append((height, width, frame))
 
 capture = IR16Capture()
 capture.SetupGraphWithBytesCallback(NewBytesFrameEvent(got_a_frame))
 capture.RunGraph()
-time.sleep(3)  # warm-up
+time.sleep(3)
 
-# =========================
-# Helpers
-# =========================
 def short_array_to_numpy(h, w, frame_iterable):
-    """Convert incoming 16-bit centikelvin buffer to (H, W) uint16 array."""
     return np.fromiter(frame_iterable, dtype=np.uint16).reshape(h, w)
 
 def centikelvin_to_celsius(t_ck):
-    """Convert centikelvin to Celsius."""
     return (t_ck - 27315) / 100.0
 
-# =========================
-# Main App
-# =========================
 class ThermalVideoApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Thermal Camera Viewer – Masked Threshold ROI + Vertical Line")
+        self.root.title("Tool wear IR Monitor")
         self.root.protocol("WM_DELETE_WINDOW", self.quit_app)
 
-        # State
         self.running = True
-        self.suspend_video = False     # Pause redraw while drawing mask/line
+        self.suspend_video = False
         self.recording = False
         self.recording_start_time = None
         self.stream_start_time = time.time()
-        self.data_records = []         # [elapsed_s, avg_temp_C, max_temp_C, roi_area_px2]
+        # rows: [elapsed_s, edge_avg, edge_max, edge_area, hline1..hline5]
+        self.data_records = []
         self.after_id = None
 
-        # Mask state (rectangle)
-        self.user_mask = None          # uint8 mask same size as display (0 outside, 1 inside)
-        self.mask_bounds = None        # (x0, y0, x1, y1)
-        self._drag_start = None        # for mask draw
+        self.user_mask = None
+        self.mask_bounds = None
+        self._drag_start = None
         self._rubberband_id = None
 
-        # Vertical line measurement state
-        self.vline_coords = None       # (x, y0, y1) in display pixels
+        self.vline_coords = None   # (x, y0, y1)
         self.vline_length_px = 0
-        self._line_drag_start = None   # (x0, y0) start for line draw
+        self._line_drag_start = None
         self._line_rubberband_id = None
 
-        # Canvas
         self.canvas = tk.Canvas(root)
         self.canvas.grid(row=0, column=0, padx=5, pady=5)
 
-        # Initial dims from preview
         if incoming_frames:
             h, w, f = incoming_frames[-1]
             preview = short_array_to_numpy(h, w, f)
@@ -118,19 +95,15 @@ class ThermalVideoApp:
         self.heightScaled = int(preview.shape[0] * SCALE_PERCENT / 100)
         self.dim = (self.widthScaled, self.heightScaled)
 
-        # Init empty mask for display size
         self.user_mask = np.zeros((self.heightScaled, self.widthScaled), np.uint8)
 
-        # Plots
         self.time_data, self.avg_series, self.max_series = [], [], []
-
         self.fig_avg, self.ax_avg = plt.subplots(figsize=(4, 2.5))
         self.line_avg, = self.ax_avg.plot([], [], label='Avg Temp (°C)')
         self.ax_avg.set_title("Average ROI Temperature")
         self.ax_avg.set_xlabel("Time (s)")
         self.ax_avg.set_ylabel("Temp (°C)")
-        self.ax_avg.grid(True)
-        self.ax_avg.legend(loc='upper right')
+        self.ax_avg.grid(True); self.ax_avg.legend(loc='upper right')
         self.canvas_avg = FigureCanvasTkAgg(self.fig_avg, master=root)
         self.canvas_avg.get_tk_widget().grid(row=0, column=1, padx=5, pady=5)
 
@@ -139,29 +112,22 @@ class ThermalVideoApp:
         self.ax_max.set_title("Maximum ROI Temperature")
         self.ax_max.set_xlabel("Time (s)")
         self.ax_max.set_ylabel("Temp (°C)")
-        self.ax_max.grid(True)
-        self.ax_max.legend(loc='upper right')
+        self.ax_max.grid(True); self.ax_max.legend(loc='upper right')
         self.canvas_max = FigureCanvasTkAgg(self.fig_max, master=root)
         self.canvas_max.get_tk_widget().grid(row=1, column=1, padx=5, pady=5)
 
-        # Controls
-        control = ttk.Frame(root)
-        control.grid(row=2, column=0, columnspan=2, pady=5)
-
+        control = ttk.Frame(root); control.grid(row=2, column=0, columnspan=2, pady=5)
         ttk.Button(control, text="Define Mask", command=self.enable_mask_draw).pack(side="left", padx=5)
         ttk.Button(control, text="Clear Mask", command=self.clear_mask).pack(side="left", padx=5)
-
         ttk.Button(control, text="Define Vertical Line", command=self.enable_vertical_line).pack(side="left", padx=10)
         ttk.Button(control, text="Clear Line", command=self.clear_line).pack(side="left", padx=5)
         ttk.Label(control, text="Line length:").pack(side="left", padx=(12, 4))
         self.line_length_var = tk.StringVar(value="—")
         ttk.Label(control, textvariable=self.line_length_var).pack(side="left", padx=(0, 8))
-
         ttk.Button(control, text="Start Recording", command=self.start_recording).pack(side="left", padx=5)
         ttk.Button(control, text="Stop and Save CSV", command=self.stop_recording).pack(side="left", padx=5)
         ttk.Button(control, text="Quit", command=self.quit_app).pack(side="left", padx=5)
 
-        # Temperature span control (device)
         self.temp_range_var = tk.StringVar(value="Low (-10°C to 140°C)")
         ttk.Label(control, text="Temp Range:").pack(side="left", padx=5)
         self.temp_range_dropdown = ttk.Combobox(
@@ -172,16 +138,11 @@ class ThermalVideoApp:
         self.temp_range_dropdown.bind("<<ComboboxSelected>>", self.change_temp_range)
         self.change_temp_range()
 
-        # Start loop
         self.update_video()
 
-    # ------------------------------------------------
-    # Mask drawing (rectangle)
-    # ------------------------------------------------
+    # Mask drawing
     def enable_mask_draw(self):
-        """Enable click-and-drag rectangle drawing on the video to define a mask."""
-        self._unbind_all_draw()
-        self.suspend_video = True
+        self._unbind_all_draw(); self.suspend_video = True
         self.canvas.bind("<ButtonPress-1>", self._on_mask_start)
         self.canvas.bind("<B1-Motion>", self._on_mask_drag)
         self.canvas.bind("<ButtonRelease-1>", self._on_mask_release)
@@ -189,12 +150,10 @@ class ThermalVideoApp:
     def _on_mask_start(self, event):
         self._drag_start = (self._clamp_x(event.x), self._clamp_y(event.y))
         if self._rubberband_id is not None:
-            self.canvas.delete(self._rubberband_id)
-            self._rubberband_id = None
+            self.canvas.delete(self._rubberband_id); self._rubberband_id = None
 
     def _on_mask_drag(self, event):
-        if not self._drag_start:
-            return
+        if not self._drag_start: return
         x0, y0 = self._drag_start
         x1, y1 = self._clamp_x(event.x), self._clamp_y(event.y)
         if self._rubberband_id is None:
@@ -205,90 +164,59 @@ class ThermalVideoApp:
             self.canvas.coords(self._rubberband_id, x0, y0, x1, y1)
 
     def _on_mask_release(self, event):
-        if not self._drag_start:
-            return
+        if not self._drag_start: return
         x0, y0 = self._drag_start
         x1, y1 = self._clamp_x(event.x), self._clamp_y(event.y)
         self._drag_start = None
-
-        xL, xR = sorted((x0, x1))
-        yT, yB = sorted((y0, y1))
-
-        self.user_mask.fill(0)
-        self.user_mask[yT:yB, xL:xR] = 1
+        xL, xR = sorted((x0, x1)); yT, yB = sorted((y0, y1))
+        self.user_mask.fill(0); self.user_mask[yT:yB, xL:xR] = 1
         self.mask_bounds = (xL, yT, xR, yB)
-
         if self._rubberband_id is not None:
             self.canvas.delete(self._rubberband_id); self._rubberband_id = None
-
-        self._unbind_all_draw()
-        self.suspend_video = False
+        self._unbind_all_draw(); self.suspend_video = False
 
     def clear_mask(self):
-        self.user_mask.fill(0)
-        self.mask_bounds = None
+        self.user_mask.fill(0); self.mask_bounds = None
 
-    # ------------------------------------------------
-    # Vertical line measurement
-    # ------------------------------------------------
+    # Vertical line + release
     def enable_vertical_line(self):
-        """Enable click-and-drag to place a vertical line. Length is |y1 - y0| in pixels."""
-        self._unbind_all_draw()
-        self.suspend_video = True
+        self._unbind_all_draw(); self.suspend_video = True
         self.canvas.bind("<ButtonPress-1>", self._on_line_start)
         self.canvas.bind("<B1-Motion>", self._on_line_drag)
         self.canvas.bind("<ButtonRelease-1>", self._on_line_release)
 
     def _on_line_start(self, event):
-        x0 = self._clamp_x(event.x)
-        y0 = self._clamp_y(event.y)
+        x0 = self._clamp_x(event.x); y0 = self._clamp_y(event.y)
         self._line_drag_start = (x0, y0)
         if self._line_rubberband_id is not None:
-            self.canvas.delete(self._line_rubberband_id)
-            self._line_rubberband_id = None
-        # Initialize with a 1px segment so user sees it
+            self.canvas.delete(self._line_rubberband_id); self._line_rubberband_id = None
         self._line_rubberband_id = self.canvas.create_line(x0, y0, x0, y0, fill="cyan", width=2)
 
     def _on_line_drag(self, event):
-        if not self._line_drag_start or self._line_rubberband_id is None:
-            return
+        if not self._line_drag_start or self._line_rubberband_id is None: return
         x0, y0 = self._line_drag_start
         y1 = self._clamp_y(event.y)
-        # Keep line vertical at x0
         self.canvas.coords(self._line_rubberband_id, x0, y0, x0, y1)
 
     def _on_line_release(self, event):
-        if not self._line_drag_start:
-            return
-        x0, y0 = self._line_drag_start
-        y1 = self._clamp_y(event.y)
+        if not self._line_drag_start: return
+        x0, y0 = self._line_drag_start; y1 = self._clamp_y(event.y)
         self._line_drag_start = None
-
-        # Store persistent coords (vertical line)
         self.vline_coords = (x0, y0, y1)
         self.vline_length_px = abs(y1 - y0)
         self.line_length_var.set(f"{self.vline_length_px} px")
-
-        # Remove rubberband
         if self._line_rubberband_id is not None:
             self.canvas.delete(self._line_rubberband_id); self._line_rubberband_id = None
-
-        self._unbind_all_draw()
-        self.suspend_video = False
+        self._unbind_all_draw(); self.suspend_video = False
 
     def clear_line(self):
-        self.vline_coords = None
-        self.vline_length_px = 0
+        self.vline_coords = None; self.vline_length_px = 0
         self.line_length_var.set("—")
 
     def _unbind_all_draw(self):
-        """Remove any draw-mode bindings to avoid conflicts between tools."""
         for seq in ("<ButtonPress-1>", "<B1-Motion>", "<ButtonRelease-1>"):
             self.canvas.unbind(seq)
 
-    # ------------------------------------------------
-    # Device temperature span
-    # ------------------------------------------------
     def change_temp_range(self, event=None):
         selected = self.temp_range_var.get()
         if selected in TEMP_RANGES:
@@ -299,15 +227,41 @@ class ThermalVideoApp:
             except Exception as e:
                 print(f"Failed to set temperature range: {e}")
 
-    # ------------------------------------------------
+    # ----- Horizontal ROI helpers -----
+    def _horizontal_rois_from_vline(self):
+        """
+        Returns y positions for 5 horizontal lines:
+        - 1/5, 2/5, 3/5, 4/5 along the vertical segment
+        - plus a 5th at the bottom endpoint of the segment
+        Also returns (x_left, x_right) for the 20 px span centered at vertical x.
+        """
+        if self.vline_coords is None:
+            return [], None, None
+        x0, y0, y1 = self.vline_coords
+        y_top, y_bot = (y0, y1) if y0 <= y1 else (y1, y0)
+        seg_len = y_bot - y_top
+        if seg_len < 1:
+            return [], None, None
+
+        ys = []
+        for k in (1, 2, 3, 4):
+            yk = int(round(y_top + k * seg_len / 5.0))
+            ys.append(yk)
+        ys.append(int(y_bot))  # 5th line at the bottom endpoint
+
+        # Clamp to canvas bounds
+        ys = [max(0, min(self.heightScaled - 1, yk)) for yk in ys]
+
+        half_len = 10
+        x_left  = max(0, x0 - half_len)
+        x_right = min(self.widthScaled - 1, x0 + half_len)
+        return ys, x_left, x_right
+
     # Frame loop
-    # ------------------------------------------------
     def update_video(self):
-        if not self.running:
-            return
+        if not self.running: return
         if self.suspend_video:
-            self.after_id = self.root.after(FRAME_DELAY_MS, self.update_video)
-            return
+            self.after_id = self.root.after(FRAME_DELAY_MS, self.update_video); return
 
         if incoming_frames:
             h, w, f = incoming_frames[-1]
@@ -320,29 +274,21 @@ class ThermalVideoApp:
             frame_bgr = np.zeros((self.heightScaled, self.widthScaled, 3), np.uint8)
             arr_c = np.zeros((self.heightScaled, self.widthScaled), dtype=np.float32)
 
-        # Threshold inside mask only
         contours = []
         if self.user_mask is not None and np.any(self.user_mask):
             gray = cv.cvtColor(frame_bgr, cv.COLOR_BGR2GRAY)
-            masked_gray = gray.copy()
-            masked_gray[self.user_mask == 0] = 0
+            masked_gray = gray.copy(); masked_gray[self.user_mask == 0] = 0
             blur = cv.GaussianBlur(masked_gray, (5, 5), 0)
             _, thresh = cv.threshold(blur, THRESH_8U, 255, cv.THRESH_BINARY)
             kernel = cv.getStructuringElement(cv.MORPH_RECT, (5, 5))
             thresh = cv.morphologyEx(thresh, cv.MORPH_OPEN, kernel)
             thresh = cv.morphologyEx(thresh, cv.MORPH_CLOSE, kernel)
             contours, _ = cv.findContours(thresh, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
-
-            # Dim outside masked area for clarity
             outside = (self.user_mask == 0)
             frame_bgr[outside] = (frame_bgr[outside] * 0.4).astype(np.uint8)
 
-        # ROI stats from largest contour
         mask = np.zeros((self.heightScaled, self.widthScaled), np.uint8)
-        avg_temp_C = 0.0
-        max_temp_C = 0.0
-        roi_area_px2 = 0
-
+        avg_temp_C = 0.0; max_temp_C = 0.0; roi_area_px2 = 0
         if contours:
             largest = max(contours, key=cv.contourArea)
             cv.drawContours(frame_bgr, [largest], -1, (0, 255, 0), 2)
@@ -353,12 +299,23 @@ class ThermalVideoApp:
                 max_temp_C = float(np.max(roi_vals))
                 roi_area_px2 = int(roi_vals.size)
 
-        # Recording
+        # Horizontal ROI averages: 5 lines now
+        hline_avgs = [np.nan]*5
+        if self.vline_coords is not None:
+            ys, x_left, x_right = self._horizontal_rois_from_vline()
+            if ys and x_left is not None:
+                for i, yk in enumerate(ys):
+                    seg = arr_c[yk, x_left:x_right+1]
+                    if seg.size > 0:
+                        hline_avgs[i] = float(np.mean(seg))
+
+        # Recording row
         if self.recording:
             elapsed_rec = time.time() - self.recording_start_time
-            self.data_records.append([elapsed_rec, avg_temp_C, max_temp_C, roi_area_px2])
+            row = [elapsed_rec, avg_temp_C, max_temp_C, roi_area_px2] + hline_avgs
+            self.data_records.append(row)
 
-        # Plot updates
+        # Plots (edge-ROI)
         elapsed_plot = time.time() - self.stream_start_time
         self.time_data.append(elapsed_plot)
         self.avg_series.append(avg_temp_C)
@@ -388,9 +345,8 @@ class ThermalVideoApp:
         self.canvas.delete("all")
         self.canvas.config(width=self.widthScaled, height=self.heightScaled)
         self.canvas.create_image(0, 0, anchor=tk.NW, image=imgtk)
-        self.canvas.imgtk = imgtk  # keep ref
+        self.canvas.imgtk = imgtk
 
-        # Persistent overlays
         if self.mask_bounds is not None:
             xL, yT, xR, yB = self.mask_bounds
             self.canvas.create_rectangle(xL, yT, xR, yB, outline="yellow", width=2)
@@ -398,23 +354,22 @@ class ThermalVideoApp:
         if self.vline_coords is not None:
             x0, y0, y1 = self.vline_coords
             self.canvas.create_line(x0, y0, x0, y1, fill="cyan", width=2)
-            # Label near the midpoint
             y_mid = int((y0 + y1) / 2)
-            self.canvas.create_text(
-                min(x0 + 8, self.widthScaled - 10),
-                y_mid,
-                text=f"{self.vline_length_px} px",
-                fill="white",
-                anchor="w",
-                font=("TkDefaultFont", 10, "bold")
-            )
+            self.canvas.create_text(min(x0 + 8, self.widthScaled - 10), y_mid,
+                                    text=f"{self.vline_length_px} px",
+                                    fill="white", anchor="w",
+                                    font=("TkDefaultFont", 10, "bold"))
 
-        # Next frame
+            ys, x_left, x_right = self._horizontal_rois_from_vline()
+            for i, yk in enumerate(ys):
+                self.canvas.create_line(x_left, yk, x_right, yk, fill="cyan", width=2)
+                label = "" if np.isnan(hline_avgs[i]) else f"{hline_avgs[i]:.1f}°C"
+                self.canvas.create_text(min(x_right + 6, self.widthScaled - 2), yk,
+                                        text=label, fill="white", anchor="w",
+                                        font=("TkDefaultFont", 9, "bold"))
+
         self.after_id = self.root.after(FRAME_DELAY_MS, self.update_video)
 
-    # ------------------------------------------------
-    # Recording controls
-    # ------------------------------------------------
     def start_recording(self):
         self.data_records = []
         self.recording_start_time = time.time()
@@ -423,26 +378,31 @@ class ThermalVideoApp:
 
     def stop_recording(self):
         if not self.recording or not self.data_records:
-            print("No data recorded")
-            return
+            print("No data recorded"); return
         self.recording = False
-        path = filedialog.asksaveasfilename(
-            defaultextension='.csv',
-            filetypes=[('CSV', '*.csv')],
-            title='Save ROI Data As'
-        )
+        path = filedialog.asksaveasfilename(defaultextension='.csv',
+                                            filetypes=[('CSV', '*.csv')],
+                                            title='Save ROI Data As')
         if path:
             import csv
+            header = [
+                'elapsed_s',
+                'edgeROI_avg_temp_C',
+                'edgeROI_max_temp_C',
+                'edgeROI_area_px2',
+                'line1_avg_C',
+                'line2_avg_C',
+                'line3_avg_C',
+                'line4_avg_C',
+                'baseline_avg_C'
+            ]
             with open(path, 'w', newline='') as f:
                 writer = csv.writer(f)
-                writer.writerow(['elapsed_s', 'avg_temp_C', 'max_temp_C', 'roi_area_px2'])
+                writer.writerow(header)
                 writer.writerows(self.data_records)
             print(f"Data saved to {path}")
         self.data_records = []
 
-    # ------------------------------------------------
-    # Shutdown
-    # ------------------------------------------------
     def quit_app(self):
         self.running = False
         try:
@@ -454,19 +414,11 @@ class ThermalVideoApp:
                 self.root.after_cancel(self.after_id)
             except Exception as e:
                 print("Error cancelling after callback:", e)
-        self.root.quit()
-        self.root.destroy()
-        sys.exit(0)
+        self.root.quit(); self.root.destroy(); sys.exit(0)
 
-    # ------------------------------------------------
-    # Misc
-    # ------------------------------------------------
     def _clamp_x(self, x): return max(0, min(self.widthScaled - 1, x))
     def _clamp_y(self, y): return max(0, min(self.heightScaled - 1, y))
 
-# =========================
-# Entrypoint
-# =========================
 if __name__ == "__main__":
     root = tk.Tk()
     app = ThermalVideoApp(root)
