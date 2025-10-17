@@ -1,0 +1,2 @@
+# Contributions  
+If you want to contribute to the code you can create your own branch just send me a message at juanp.gchavira@gmail.com to talk and know what are you planning to do with this code. Of course if you're planning on using this code in your research, please cite my work. Don't be afraid to reach out and give me any feedback or suggestion I can also answer questions. It would be cool to use this code to gather enough data to build a machine learning model to predict tool wear using temperature, If you're also interested in that pleae reach out.
