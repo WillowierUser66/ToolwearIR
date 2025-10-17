@@ -21,14 +21,12 @@ To install OpenCV just run in your terminal:
 ```
 pip install opencv-python
 ```
-## Contributions
-If you want to contribute to the code you can create your own branch just send me a message at juanp.gchavira@gmail.com to talk and know what are you planning to do with this code. Of course if you're planning on using this code in your research, please cite my work. Don't be afraid to reach out and give me any feedback or suggestion I can also answer questions. It would be cool to use this code to gather enough data to build a machine learning model to predict tool wear using temperature, If you're also interested in that pleae reach out. 
-
 ## References 
 [1]  
 [2]  
 [3] J. A. Ramirez-Nunez, M. Trejo-Hernandez, R. J. Romero-Troncoso, G. Herrera-Ruiz, and R. A. Osornio-Rios, “Smart-sensor for tool-breakage detection in milling process under dry and wet conditions based on infrared thermography,” Int. J. Adv. Manuf. Technol., vol. 97, no. 5, Art. no. 5, July 2018, [doi: 10.1007/s00170-018-2060-4](https://link.springer.com/article/10.1007/s00170-018-2060-4).  
 [4] N. Brili, M. Ficko, and S. Klančnik, “Tool Condition Monitoring of the Cutting Capability of a Turning Tool Based on Thermography,” Sensors, vol. 21, no. 19, Art. no. 19, Jan. 2021, [doi: 10.3390/s21196687](https://www.mdpi.com/1424-8220/21/19/6687).
+
 
 
 
