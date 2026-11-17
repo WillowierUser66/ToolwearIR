@@ -13,11 +13,18 @@ import matplotlib.pyplot as plt
 SCALE_PERCENT   = 200
 FRAME_DELAY_MS  = int(1000/60)
 THRESH_8U       = 110
+PLOT_WINDOW_S   = 10     # seconds of history visible in the live plots
+PLOT_HISTORY_LEN = 300   # points kept for plotting (~30 s at the Lepton's ~9 fps)
+# Order matches _horizontal_rois_from_vline() and the CSV columns
+HLINE_LABELS    = ["Line 1", "Line 2", "Line 3", "Line 4", "Baseline"]
 
+# On the Lepton 3.5 the radiometric range is selected by the gain mode:
+# HIGH gain = -10..140 °C (finer resolution), LOW gain = -10..400 °C.
 TEMP_RANGES = {
-    "Low (-10°C to 140°C)":  (27315 - 10 * 100,  27315 + 140 * 100),
-    "High (-10°C to 400°C)": (27315 - 10 * 100,  27315 + 400 * 100),
+    "Low (-10°C to 140°C)":  "HIGH",
+    "High (-10°C to 400°C)": "LOW",
 }
+DEFAULT_TEMP_RANGE = "High (-10°C to 400°C)"
 
 CoInitialize()
 bits, _ = platform.architecture()
@@ -33,7 +40,6 @@ if not found_device:
     sys.exit(1)
 
 lep = found_device.Open()
-lep.sys.SetGainMode(CCI.Sys.GainMode.LOW)
 
 clr.AddReference("ManagedIR16Filters")
 from IR16Filters import IR16Capture, NewBytesFrameEvent
@@ -48,8 +54,14 @@ capture.SetupGraphWithBytesCallback(NewBytesFrameEvent(got_a_frame))
 capture.RunGraph()
 time.sleep(3)
 
-def short_array_to_numpy(h, w, frame_iterable):
-    return np.fromiter(frame_iterable, dtype=np.uint16).reshape(h, w)
+def short_array_to_numpy(h, w, frame):
+    # Read the .NET UInt16[] directly through the buffer protocol; iterating it
+    # element by element (np.fromiter) costs ~100 ms per frame.
+    try:
+        arr = np.frombuffer(memoryview(frame), dtype=np.uint16).copy()
+    except (TypeError, ValueError, BufferError):
+        arr = np.fromiter(frame, dtype=np.uint16)
+    return arr.reshape(h, w)
 
 def centikelvin_to_celsius(t_ck):
     return (t_ck - 27315) / 100.0
@@ -68,6 +80,7 @@ class ThermalVideoApp:
         # rows: [elapsed_s, edge_avg, edge_max, edge_area, hline1..hline5]
         self.data_records = []
         self.after_id = None
+        self._last_frame = None  # last camera frame processed, to skip repeats
 
         self.user_mask = None
         self.mask_bounds = None
@@ -94,15 +107,20 @@ class ThermalVideoApp:
 
         self.user_mask = np.zeros((self.heightScaled, self.widthScaled), np.uint8)
 
-        self.time_data, self.avg_series, self.max_series = [], [], []
-        self.fig_avg, self.ax_avg = plt.subplots(figsize=(4, 2.5))
-        self.line_avg, = self.ax_avg.plot([], [], label='Avg Temp (°C)')
-        self.ax_avg.set_title("Average ROI Temperature")
-        self.ax_avg.set_xlabel("Time (s)")
-        self.ax_avg.set_ylabel("Temp (°C)")
-        self.ax_avg.grid(True); self.ax_avg.legend(loc='upper right')
-        self.canvas_avg = FigureCanvasTkAgg(self.fig_avg, master=root)
-        self.canvas_avg.get_tk_widget().grid(row=0, column=1, padx=5, pady=5)
+        # Plot history is bounded; only the last PLOT_WINDOW_S seconds are shown.
+        self.time_data = deque(maxlen=PLOT_HISTORY_LEN)
+        self.max_series = deque(maxlen=PLOT_HISTORY_LEN)
+        self.hline_series = [deque(maxlen=PLOT_HISTORY_LEN) for _ in HLINE_LABELS]
+
+        self.fig_lines, self.ax_lines = plt.subplots(figsize=(4, 2.5))
+        self.hline_plots = [self.ax_lines.plot([], [], label=lbl)[0] for lbl in HLINE_LABELS]
+        self.ax_lines.set_title("Horizontal Line Temperatures")
+        self.ax_lines.set_xlabel("Time (s)")
+        self.ax_lines.set_ylabel("Temp (°C)")
+        self.ax_lines.grid(True); self.ax_lines.legend(loc='upper left', fontsize=7, ncol=3)
+        self.fig_lines.tight_layout()
+        self.canvas_lines = FigureCanvasTkAgg(self.fig_lines, master=root)
+        self.canvas_lines.get_tk_widget().grid(row=0, column=1, padx=5, pady=5)
 
         self.fig_max, self.ax_max = plt.subplots(figsize=(4, 2.5))
         self.line_max, = self.ax_max.plot([], [], label='Max Temp (°C)')
@@ -110,6 +128,7 @@ class ThermalVideoApp:
         self.ax_max.set_xlabel("Time (s)")
         self.ax_max.set_ylabel("Temp (°C)")
         self.ax_max.grid(True); self.ax_max.legend(loc='upper right')
+        self.fig_max.tight_layout()
         self.canvas_max = FigureCanvasTkAgg(self.fig_max, master=root)
         self.canvas_max.get_tk_widget().grid(row=1, column=1, padx=5, pady=5)
 
@@ -125,7 +144,7 @@ class ThermalVideoApp:
         ttk.Button(control, text="Stop and Save CSV", command=self.stop_recording).pack(side="left", padx=5)
         ttk.Button(control, text="Quit", command=self.quit_app).pack(side="left", padx=5)
 
-        self.temp_range_var = tk.StringVar(value="Low (-10°C to 140°C)")
+        self.temp_range_var = tk.StringVar(value=DEFAULT_TEMP_RANGE)
         ttk.Label(control, text="Temp Range:").pack(side="left", padx=5)
         self.temp_range_dropdown = ttk.Combobox(
             control, textvariable=self.temp_range_var, state="readonly",
@@ -217,10 +236,11 @@ class ThermalVideoApp:
     def change_temp_range(self, event=None):
         selected = self.temp_range_var.get()
         if selected in TEMP_RANGES:
-            low_ck, high_ck = TEMP_RANGES[selected]
+            gain_name = TEMP_RANGES[selected]
             try:
-                lep.sys.SetTempRangeHighLow(high_ck, low_ck)
-                print(f"Temperature range set to: {selected}")
+                lep.sys.SetGainMode(getattr(CCI.Sys.GainMode, gain_name))
+                actual = lep.sys.GetGainMode()
+                print(f"Temperature range set to: {selected} (gain mode {actual})")
             except Exception as e:
                 print(f"Failed to set temperature range: {e}")
 
@@ -263,8 +283,14 @@ class ThermalVideoApp:
         if self.suspend_video:
             self.after_id = self.root.after(FRAME_DELAY_MS, self.update_video); return
 
-        if incoming_frames:
-            h, w, f = incoming_frames[-1]
+        latest = incoming_frames[-1] if incoming_frames else None
+        if latest is not None and latest is self._last_frame:
+            # The camera delivers ~9 fps; don't reprocess/redraw the same frame.
+            self.after_id = self.root.after(FRAME_DELAY_MS, self.update_video); return
+        self._last_frame = latest
+
+        if latest is not None:
+            h, w, f = latest
             arr_ck = short_array_to_numpy(h, w, f)
             arr_ck_resized = cv.resize(arr_ck, self.dim, interpolation=cv.INTER_NEAREST)
             arr_c = centikelvin_to_celsius(arr_ck_resized).astype(np.float32)
@@ -315,28 +341,28 @@ class ThermalVideoApp:
             row = [elapsed_rec, avg_temp_C, max_temp_C, roi_area_px2] + hline_avgs
             self.data_records.append(row)
 
-        # Plots (edge-ROI)
+        # Plots: horizontal-line temperatures (top) and edge-ROI max (bottom)
         elapsed_plot = time.time() - self.stream_start_time
         self.time_data.append(elapsed_plot)
-        self.avg_series.append(avg_temp_C)
         self.max_series.append(max_temp_C)
+        for series, val in zip(self.hline_series, hline_avgs):
+            series.append(val)
 
-        self.line_avg.set_data(self.time_data, self.avg_series)
-        self.ax_avg.set_xlim(max(0, elapsed_plot - 10), elapsed_plot + 1)
-        last_avg = self.avg_series[-60:]
-        ymin_a = min(last_avg) if last_avg else 0
-        ymax_a = max(last_avg) if last_avg else 1
-        pad_a = max(0.5, 0.05 * (ymax_a - ymin_a))
-        self.ax_avg.set_ylim(ymin_a - pad_a, ymax_a + pad_a)
-        self.canvas_avg.draw()
+        t = np.asarray(self.time_data)
+        visible = t >= elapsed_plot - PLOT_WINDOW_S
+        xlim = (max(0, elapsed_plot - PLOT_WINDOW_S), elapsed_plot + 1)
 
-        self.line_max.set_data(self.time_data, self.max_series)
-        self.ax_max.set_xlim(max(0, elapsed_plot - 10), elapsed_plot + 1)
-        last_max = self.max_series[-60:]
-        ymin_m = min(last_max) if last_max else 0
-        ymax_m = max(last_max) if last_max else 1
-        pad_m = max(0.5, 0.05 * (ymax_m - ymin_m))
-        self.ax_max.set_ylim(ymin_m - pad_m, ymax_m + pad_m)
+        hl = np.array([np.asarray(s) for s in self.hline_series])  # NaN = no line defined
+        for plot, vals in zip(self.hline_plots, hl):
+            plot.set_data(t, vals)
+        self.ax_lines.set_xlim(*xlim)
+        self.ax_lines.set_ylim(*self._padded_ylim(hl[:, visible]))
+        self.canvas_lines.draw()
+
+        mx = np.asarray(self.max_series)
+        self.line_max.set_data(t, mx)
+        self.ax_max.set_xlim(*xlim)
+        self.ax_max.set_ylim(*self._padded_ylim(mx[visible]))
         self.canvas_max.draw()
 
         # Draw on Tk canvas
@@ -415,6 +441,15 @@ class ThermalVideoApp:
             except Exception as e:
                 print("Error cancelling after callback:", e)
         self.root.quit(); self.root.destroy(); sys.exit(0)
+
+    @staticmethod
+    def _padded_ylim(values):
+        finite = np.asarray(values)[np.isfinite(values)]
+        if finite.size == 0:
+            return 0.0, 1.0
+        lo, hi = float(finite.min()), float(finite.max())
+        pad = max(0.5, 0.05 * (hi - lo))
+        return lo - pad, hi + pad
 
     def _clamp_x(self, x): return max(0, min(self.widthScaled - 1, x))
     def _clamp_y(self, y): return max(0, min(self.heightScaled - 1, y))
