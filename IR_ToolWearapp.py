@@ -18,6 +18,23 @@ PLOT_HISTORY_LEN = 300   # points kept for plotting (~30 s at the Lepton's ~9 fp
 # Order matches _horizontal_rois_from_vline() and the CSV columns
 HLINE_LABELS    = ["Line 1", "Line 2", "Line 3", "Line 4", "Baseline"]
 
+# ----- UI theme -----
+UI_FONT = "Segoe UI" if sys.platform == "win32" else "Helvetica"
+THEME = {
+    "bg": "#0f1115", "panel": "#161a21", "card": "#1c2029", "card_hover": "#262b36",
+    "border": "#2a2f3a", "text": "#e6e8ee", "muted": "#8a93a6",
+    "accent": "#3b82f6", "accent_hover": "#2563eb",
+    "danger": "#ef4444", "danger_hover": "#dc2626", "danger_bg": "#3a1518",
+    "success": "#22c55e", "success_bg": "#12301f",
+}
+LINE_COLORS = ["#60a5fa", "#fbbf24", "#34d399", "#f472b6", "#a78bfa"]  # Line 1-4, Baseline
+MAX_COLOR   = "#fb923c"
+MASK_COLOR  = "#facc15"
+CONTOUR_COLOR = "#4ade80"
+DISPLAY_ZOOM = 2   # on-screen enlargement only; processing/CSV stay at SCALE_PERCENT
+VLINE_COLOR = "#e5e7eb"
+HINT_IDLE   = "Draw a mask around the endmill, then a vertical line along it for the temperature profile."
+
 # On the Lepton 3.5 the radiometric range is selected by the gain mode:
 # HIGH gain = -10..140 °C (finer resolution), LOW gain = -10..400 °C.
 TEMP_RANGES = {
@@ -92,8 +109,7 @@ class ThermalVideoApp:
         self._line_drag_start = None
         self._line_rubberband_id = None
 
-        self.canvas = tk.Canvas(root)
-        self.canvas.grid(row=0, column=0, padx=5, pady=5)
+        self._frame_times = deque(maxlen=20)  # for the fps readout
 
         if incoming_frames:
             h, w, f = incoming_frames[-1]
@@ -112,53 +128,239 @@ class ThermalVideoApp:
         self.max_series = deque(maxlen=PLOT_HISTORY_LEN)
         self.hline_series = [deque(maxlen=PLOT_HISTORY_LEN) for _ in HLINE_LABELS]
 
-        self.fig_lines, self.ax_lines = plt.subplots(figsize=(4, 2.5))
-        self.hline_plots = [self.ax_lines.plot([], [], label=lbl)[0] for lbl in HLINE_LABELS]
-        self.ax_lines.set_title("Horizontal Line Temperatures")
-        self.ax_lines.set_xlabel("Time (s)")
-        self.ax_lines.set_ylabel("Temp (°C)")
-        self.ax_lines.grid(True); self.ax_lines.legend(loc='upper left', fontsize=7, ncol=3)
-        self.fig_lines.tight_layout()
-        self.canvas_lines = FigureCanvasTkAgg(self.fig_lines, master=root)
-        self.canvas_lines.get_tk_widget().grid(row=0, column=1, padx=5, pady=5)
-
-        self.fig_max, self.ax_max = plt.subplots(figsize=(4, 2.5))
-        self.line_max, = self.ax_max.plot([], [], label='Max Temp (°C)')
-        self.ax_max.set_title("Maximum ROI Temperature")
-        self.ax_max.set_xlabel("Time (s)")
-        self.ax_max.set_ylabel("Temp (°C)")
-        self.ax_max.grid(True); self.ax_max.legend(loc='upper right')
-        self.fig_max.tight_layout()
-        self.canvas_max = FigureCanvasTkAgg(self.fig_max, master=root)
-        self.canvas_max.get_tk_widget().grid(row=1, column=1, padx=5, pady=5)
-
-        control = ttk.Frame(root); control.grid(row=2, column=0, columnspan=2, pady=5)
-        ttk.Button(control, text="Define Mask", command=self.enable_mask_draw).pack(side="left", padx=5)
-        ttk.Button(control, text="Clear Mask", command=self.clear_mask).pack(side="left", padx=5)
-        ttk.Button(control, text="Define Vertical Line", command=self.enable_vertical_line).pack(side="left", padx=10)
-        ttk.Button(control, text="Clear Line", command=self.clear_line).pack(side="left", padx=5)
-        ttk.Label(control, text="Line length:").pack(side="left", padx=(12, 4))
-        self.line_length_var = tk.StringVar(value="—")
-        ttk.Label(control, textvariable=self.line_length_var).pack(side="left", padx=(0, 8))
-        ttk.Button(control, text="Start Recording", command=self.start_recording).pack(side="left", padx=5)
-        ttk.Button(control, text="Stop and Save CSV", command=self.stop_recording).pack(side="left", padx=5)
-        ttk.Button(control, text="Quit", command=self.quit_app).pack(side="left", padx=5)
-
-        self.temp_range_var = tk.StringVar(value=DEFAULT_TEMP_RANGE)
-        ttk.Label(control, text="Temp Range:").pack(side="left", padx=5)
-        self.temp_range_dropdown = ttk.Combobox(
-            control, textvariable=self.temp_range_var, state="readonly",
-            values=list(TEMP_RANGES.keys()), width=22
-        )
-        self.temp_range_dropdown.pack(side="left", padx=5)
-        self.temp_range_dropdown.bind("<<ComboboxSelected>>", self.change_temp_range)
+        self._build_style()
+        self._build_layout()
+        self._use_dark_titlebar()
         self.change_temp_range()
 
         self.update_video()
 
+    # ----- Look & layout -----
+    def _build_style(self):
+        T = THEME
+        self.root.configure(bg=T["bg"])
+        style = ttk.Style(self.root)
+        style.theme_use("clam")
+        style.configure(".", background=T["bg"], foreground=T["text"],
+                        font=(UI_FONT, 10), borderwidth=0, focuscolor=T["bg"])
+        style.configure("TFrame", background=T["bg"])
+        style.configure("Card.TFrame", background=T["card"])
+        style.configure("Side.TFrame", background=T["panel"])
+        style.configure("TLabel", background=T["bg"], foreground=T["text"])
+        style.configure("Title.TLabel", font=(UI_FONT, 15, "bold"))
+        style.configure("Subtitle.TLabel", foreground=T["muted"], font=(UI_FONT, 9))
+        style.configure("Footer.TLabel", foreground=T["muted"], font=(UI_FONT, 9))
+        style.configure("Side.TLabel", background=T["panel"], foreground=T["text"])
+        style.configure("Section.TLabel", background=T["panel"], foreground=T["muted"],
+                        font=(UI_FONT, 8, "bold"))
+        style.configure("SideMuted.TLabel", background=T["panel"], foreground=T["muted"],
+                        font=(UI_FONT, 9))
+        style.configure("Value.TLabel", background=T["panel"], foreground=T["text"],
+                        font=(UI_FONT, 15, "bold"))
+        style.configure("TSeparator", background=T["border"])
+
+        def button(name, bg, hover, fg="#ffffff"):
+            style.configure(name, background=bg, foreground=fg, padding=(12, 8),
+                            relief="flat", borderwidth=0, focuscolor=bg,
+                            font=(UI_FONT, 10))
+            style.map(name, background=[("pressed", hover), ("active", hover)],
+                      focuscolor=[("focus", bg)])
+        button("TButton", T["card"], T["card_hover"], T["text"])
+        button("Accent.TButton", T["accent"], T["accent_hover"])
+        button("Danger.TButton", T["danger"], T["danger_hover"])
+
+        style.configure("TCombobox", fieldbackground=T["card"], background=T["card"],
+                        foreground=T["text"], arrowcolor=T["muted"], bordercolor=T["border"],
+                        lightcolor=T["card"], darkcolor=T["card"], padding=6)
+        style.map("TCombobox",
+                  fieldbackground=[("readonly", T["card"])],
+                  foreground=[("readonly", T["text"])],
+                  selectbackground=[("readonly", T["card"])],
+                  selectforeground=[("readonly", T["text"])],
+                  bordercolor=[("focus", T["accent"])])
+        self.root.option_add("*TCombobox*Listbox.background", T["card"])
+        self.root.option_add("*TCombobox*Listbox.foreground", T["text"])
+        self.root.option_add("*TCombobox*Listbox.selectBackground", T["accent"])
+        self.root.option_add("*TCombobox*Listbox.font", (UI_FONT, 10))
+
+    def _build_layout(self):
+        T = THEME
+        root = self.root
+
+        # Header: title + live/recording status pill
+        header = ttk.Frame(root, padding=(16, 12, 16, 4))
+        header.grid(row=0, column=0, columnspan=3, sticky="ew")
+        header.columnconfigure(1, weight=1)
+        ttk.Label(header, text="Tool Wear IR Monitor", style="Title.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(header, text=f"{found_device.Name}  ·  Lepton 3.5",
+                  style="Subtitle.TLabel").grid(row=1, column=0, sticky="w")
+        self.status_pill = tk.Label(header, text="", font=(UI_FONT, 9, "bold"), padx=12, pady=4)
+        self.status_pill.grid(row=0, column=2, rowspan=2, sticky="e")
+
+        # Sidebar with grouped controls
+        side = ttk.Frame(root, style="Side.TFrame", padding=16)
+        side.grid(row=1, column=0, sticky="ns", padx=(16, 8), pady=8)
+        side.columnconfigure(0, weight=1); side.columnconfigure(1, weight=1)
+        r = 0
+
+        def section(title, first=False):
+            nonlocal r
+            if not first:
+                ttk.Separator(side).grid(row=r, column=0, columnspan=2, sticky="ew", pady=12); r += 1
+            ttk.Label(side, text=title.upper(), style="Section.TLabel").grid(
+                row=r, column=0, columnspan=2, sticky="w", pady=(0, 6)); r += 1
+
+        def button_pair(left, right):
+            nonlocal r
+            ttk.Button(side, text=left[0], command=left[1]).grid(row=r, column=0, sticky="ew", padx=(0, 4))
+            ttk.Button(side, text=right[0], command=right[1]).grid(row=r, column=1, sticky="ew", padx=(4, 0))
+            r += 1
+
+        section("Edge ROI mask", first=True)
+        button_pair(("Draw mask", self.enable_mask_draw), ("Clear", self.clear_mask))
+
+        section("Temperature profile")
+        button_pair(("Draw line", self.enable_vertical_line), ("Clear", self.clear_line))
+        self.line_length_var = tk.StringVar(value="No line drawn")
+        ttk.Label(side, textvariable=self.line_length_var, style="SideMuted.TLabel").grid(
+            row=r, column=0, columnspan=2, sticky="w", pady=(6, 0)); r += 1
+
+        section("Camera range")
+        self.temp_range_var = tk.StringVar(value=DEFAULT_TEMP_RANGE)
+        self.temp_range_dropdown = ttk.Combobox(
+            side, textvariable=self.temp_range_var, state="readonly",
+            values=list(TEMP_RANGES.keys()), width=22
+        )
+        self.temp_range_dropdown.grid(row=r, column=0, columnspan=2, sticky="ew"); r += 1
+        self.temp_range_dropdown.bind("<<ComboboxSelected>>", self.change_temp_range)
+
+        section("Edge ROI readings")
+        readings = ttk.Frame(side, style="Side.TFrame")
+        readings.grid(row=r, column=0, columnspan=2, sticky="ew"); r += 1
+        self.reading_vars = {}
+        for col, (key, label) in enumerate((("avg", "Avg °C"), ("max", "Max °C"), ("area", "Area px²"))):
+            readings.columnconfigure(col, weight=1)
+            var = tk.StringVar(value="—"); self.reading_vars[key] = var
+            ttk.Label(readings, textvariable=var, style="Value.TLabel").grid(row=0, column=col, sticky="w")
+            ttk.Label(readings, text=label, style="SideMuted.TLabel").grid(row=1, column=col, sticky="w")
+
+        section("Recording")
+        self.record_button = ttk.Button(side, command=self.toggle_recording)
+        self.record_button.grid(row=r, column=0, columnspan=2, sticky="ew"); r += 1
+        self.record_info_var = tk.StringVar(value="Not recording")
+        ttk.Label(side, textvariable=self.record_info_var, style="SideMuted.TLabel").grid(
+            row=r, column=0, columnspan=2, sticky="w", pady=(6, 0)); r += 1
+        self._refresh_record_button()
+
+        side.rowconfigure(r, weight=1); r += 1  # push Quit to the bottom
+        ttk.Button(side, text="Quit", command=self.quit_app).grid(
+            row=r, column=0, columnspan=2, sticky="ew")
+
+        # Video card
+        video_card = ttk.Frame(root, style="Card.TFrame", padding=8)
+        video_card.grid(row=1, column=1, sticky="n", padx=8, pady=8)
+        self.canvas = tk.Canvas(video_card, width=self.widthScaled * DISPLAY_ZOOM,
+                                height=self.heightScaled * DISPLAY_ZOOM,
+                                bg="#000000", highlightthickness=0, bd=0)
+        self.canvas.pack()
+
+        # Plot cards
+        plots = ttk.Frame(root)
+        plots.grid(row=1, column=2, sticky="n", padx=(8, 16), pady=8)
+
+        def plot_card(row, title, pady):
+            card = ttk.Frame(plots, style="Card.TFrame", padding=4)
+            card.grid(row=row, column=0, pady=pady)
+            fig, ax = plt.subplots(figsize=(4.6, 2.32), dpi=100)
+            self._style_axes(fig, ax, title)
+            canvas = FigureCanvasTkAgg(fig, master=card)
+            canvas.get_tk_widget().configure(bg=T["card"], highlightthickness=0)
+            canvas.get_tk_widget().pack()
+            return fig, ax, canvas
+
+        self.fig_lines, self.ax_lines, self.canvas_lines = plot_card(0, "Horizontal line temperatures", (0, 8))
+        self.hline_plots = [self.ax_lines.plot([], [], label=lbl, color=c, linewidth=1.6)[0]
+                            for lbl, c in zip(HLINE_LABELS, LINE_COLORS)]
+        self.ax_lines.set_title(self.ax_lines.get_title("left"), loc="left", color=T["text"],
+                                fontsize=10, fontweight="bold", pad=20)
+        # Legend sits between the title and the plot area so it never covers traces.
+        self.ax_lines.legend(loc="lower left", bbox_to_anchor=(0, 1.0), borderaxespad=0.2,
+                             fontsize=7, ncol=5, frameon=False, labelcolor=T["text"],
+                             handlelength=1.2, columnspacing=1.0)
+        self.fig_lines.tight_layout(pad=0.8)
+
+        self.fig_max, self.ax_max, self.canvas_max = plot_card(1, "Edge ROI maximum temperature", 0)
+        self.line_max, = self.ax_max.plot([], [], color=MAX_COLOR, linewidth=1.6)
+        self.fig_max.tight_layout(pad=0.8)
+
+        # Footer: drawing hints + fps
+        footer = ttk.Frame(root, padding=(16, 0, 16, 10))
+        footer.grid(row=2, column=0, columnspan=3, sticky="ew")
+        footer.columnconfigure(0, weight=1)
+        self.hint_var = tk.StringVar(value=HINT_IDLE)
+        ttk.Label(footer, textvariable=self.hint_var, style="Footer.TLabel").grid(row=0, column=0, sticky="w")
+        self.fps_var = tk.StringVar(value="")
+        ttk.Label(footer, textvariable=self.fps_var, style="Footer.TLabel").grid(row=0, column=1, sticky="e")
+
+        root.resizable(False, False)
+
+    @staticmethod
+    def _style_axes(fig, ax, title):
+        T = THEME
+        fig.patch.set_facecolor(T["card"]); ax.set_facecolor(T["card"])
+        ax.set_title(title, color=T["text"], fontsize=10, loc="left", fontweight="bold", pad=8)
+        ax.set_xlabel("Time (s)", color=T["muted"], fontsize=8)
+        ax.set_ylabel("°C", color=T["muted"], fontsize=8)
+        ax.tick_params(colors=T["muted"], labelsize=8, length=0)
+        for side in ("top", "right"):
+            ax.spines[side].set_visible(False)
+        for side in ("left", "bottom"):
+            ax.spines[side].set_color(T["border"])
+        ax.grid(True, color=T["border"], linewidth=0.6)
+
+    def _use_dark_titlebar(self):
+        # Windows 10/11: ask DWM for a dark title bar to match the theme.
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+            self.root.update_idletasks()
+            hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
+            value = ctypes.c_int(1)
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(value), ctypes.sizeof(value))
+        except Exception:
+            pass
+
+    def _set_drawing(self, hint):
+        self.hint_var.set(hint or HINT_IDLE)
+        self.canvas.configure(cursor="crosshair" if hint else "")
+
+    def _refresh_record_button(self):
+        if self.recording:
+            self.record_button.configure(text="■  Stop and save CSV", style="Danger.TButton")
+        else:
+            self.record_button.configure(text="●  Start recording", style="Accent.TButton")
+
+    def _update_status(self, have_signal):
+        T = THEME
+        if self.recording:
+            secs = int(time.time() - self.recording_start_time)
+            self.status_pill.configure(text=f"●  REC  {secs // 60:02d}:{secs % 60:02d}",
+                                       bg=T["danger_bg"], fg=T["danger"])
+            self.record_info_var.set(f"{secs // 60:02d}:{secs % 60:02d}  ·  {len(self.data_records)} samples")
+        elif have_signal:
+            self.status_pill.configure(text="●  LIVE", bg=T["success_bg"], fg=T["success"])
+        else:
+            self.status_pill.configure(text="NO SIGNAL", bg=T["card"], fg=T["muted"])
+        if len(self._frame_times) > 1:
+            span = self._frame_times[-1] - self._frame_times[0]
+            if span > 0:
+                self.fps_var.set(f"{(len(self._frame_times) - 1) / span:.1f} fps")
+
     # Mask drawing
     def enable_mask_draw(self):
         self._unbind_all_draw(); self.suspend_video = True
+        self._set_drawing("Drag on the image to draw the mask rectangle.")
         self.canvas.bind("<ButtonPress-1>", self._on_mask_start)
         self.canvas.bind("<B1-Motion>", self._on_mask_drag)
         self.canvas.bind("<ButtonRelease-1>", self._on_mask_release)
@@ -172,12 +374,13 @@ class ThermalVideoApp:
         if not self._drag_start: return
         x0, y0 = self._drag_start
         x1, y1 = self._clamp_x(event.x), self._clamp_y(event.y)
+        z = DISPLAY_ZOOM
         if self._rubberband_id is None:
             self._rubberband_id = self.canvas.create_rectangle(
-                x0, y0, x1, y1, outline="yellow", width=2, dash=(4, 3)
+                x0 * z, y0 * z, x1 * z, y1 * z, outline=MASK_COLOR, width=2, dash=(4, 3)
             )
         else:
-            self.canvas.coords(self._rubberband_id, x0, y0, x1, y1)
+            self.canvas.coords(self._rubberband_id, x0 * z, y0 * z, x1 * z, y1 * z)
 
     def _on_mask_release(self, event):
         if not self._drag_start: return
@@ -190,6 +393,7 @@ class ThermalVideoApp:
         if self._rubberband_id is not None:
             self.canvas.delete(self._rubberband_id); self._rubberband_id = None
         self._unbind_all_draw(); self.suspend_video = False
+        self._set_drawing(None)
 
     def clear_mask(self):
         self.user_mask.fill(0); self.mask_bounds = None
@@ -197,6 +401,7 @@ class ThermalVideoApp:
     # Vertical line + release
     def enable_vertical_line(self):
         self._unbind_all_draw(); self.suspend_video = True
+        self._set_drawing("Drag vertically along the endmill to place the temperature-profile line.")
         self.canvas.bind("<ButtonPress-1>", self._on_line_start)
         self.canvas.bind("<B1-Motion>", self._on_line_drag)
         self.canvas.bind("<ButtonRelease-1>", self._on_line_release)
@@ -206,13 +411,16 @@ class ThermalVideoApp:
         self._line_drag_start = (x0, y0)
         if self._line_rubberband_id is not None:
             self.canvas.delete(self._line_rubberband_id); self._line_rubberband_id = None
-        self._line_rubberband_id = self.canvas.create_line(x0, y0, x0, y0, fill="cyan", width=2)
+        z = DISPLAY_ZOOM
+        self._line_rubberband_id = self.canvas.create_line(x0 * z, y0 * z, x0 * z, y0 * z,
+                                                           fill=VLINE_COLOR, width=2)
 
     def _on_line_drag(self, event):
         if not self._line_drag_start or self._line_rubberband_id is None: return
         x0, y0 = self._line_drag_start
         y1 = self._clamp_y(event.y)
-        self.canvas.coords(self._line_rubberband_id, x0, y0, x0, y1)
+        z = DISPLAY_ZOOM
+        self.canvas.coords(self._line_rubberband_id, x0 * z, y0 * z, x0 * z, y1 * z)
 
     def _on_line_release(self, event):
         if not self._line_drag_start: return
@@ -220,14 +428,15 @@ class ThermalVideoApp:
         self._line_drag_start = None
         self.vline_coords = (x0, y0, y1)
         self.vline_length_px = abs(y1 - y0)
-        self.line_length_var.set(f"{self.vline_length_px} px")
+        self.line_length_var.set(f"Line length: {self.vline_length_px} px")
         if self._line_rubberband_id is not None:
             self.canvas.delete(self._line_rubberband_id); self._line_rubberband_id = None
         self._unbind_all_draw(); self.suspend_video = False
+        self._set_drawing(None)
 
     def clear_line(self):
         self.vline_coords = None; self.vline_length_px = 0
-        self.line_length_var.set("—")
+        self.line_length_var.set("No line drawn")
 
     def _unbind_all_draw(self):
         for seq in ("<ButtonPress-1>", "<B1-Motion>", "<ButtonRelease-1>"):
@@ -288,6 +497,8 @@ class ThermalVideoApp:
             # The camera delivers ~9 fps; don't reprocess/redraw the same frame.
             self.after_id = self.root.after(FRAME_DELAY_MS, self.update_video); return
         self._last_frame = latest
+        if latest is not None:
+            self._frame_times.append(time.time())
 
         if latest is not None:
             h, w, f = latest
@@ -315,9 +526,9 @@ class ThermalVideoApp:
 
         mask = np.zeros((self.heightScaled, self.widthScaled), np.uint8)
         avg_temp_C = 0.0; max_temp_C = 0.0; roi_area_px2 = 0
+        largest = None
         if contours:
             largest = max(contours, key=cv.contourArea)
-            cv.drawContours(frame_bgr, [largest], -1, (0, 255, 0), 2)
             cv.drawContours(mask, [largest], -1, 1, -1)
             roi_vals = arr_c[mask == 1]
             if roi_vals.size:
@@ -334,6 +545,14 @@ class ThermalVideoApp:
                     seg = arr_c[yk, x_left:x_right+1]
                     if seg.size > 0:
                         hline_avgs[i] = float(np.mean(seg))
+
+        if contours:
+            self.reading_vars["avg"].set(f"{avg_temp_C:.1f}")
+            self.reading_vars["max"].set(f"{max_temp_C:.1f}")
+            self.reading_vars["area"].set(f"{roi_area_px2}")
+        else:
+            for var in self.reading_vars.values():
+                var.set("—")
 
         # Recording row
         if self.recording:
@@ -365,36 +584,55 @@ class ThermalVideoApp:
         self.ax_max.set_ylim(*self._padded_ylim(mx[visible]))
         self.canvas_max.draw()
 
-        # Draw on Tk canvas
-        rgb = cv.cvtColor(frame_bgr, cv.COLOR_BGR2RGB)
+        # Draw on Tk canvas. Processing happens at widthScaled x heightScaled;
+        # the display is enlarged by DISPLAY_ZOOM, so overlay coords are scaled by z.
+        z = DISPLAY_ZOOM
+        display = cv.resize(frame_bgr, (self.widthScaled * z, self.heightScaled * z),
+                            interpolation=cv.INTER_LINEAR)
+        rgb = cv.cvtColor(display, cv.COLOR_BGR2RGB)
         imgtk = ImageTk.PhotoImage(Image.fromarray(rgb))
         self.canvas.delete("all")
-        self.canvas.config(width=self.widthScaled, height=self.heightScaled)
         self.canvas.create_image(0, 0, anchor=tk.NW, image=imgtk)
         self.canvas.imgtk = imgtk
 
+        if largest is not None and len(largest) > 1:
+            pts = (largest.reshape(-1, 2) * z + z // 2).ravel().tolist()
+            self.canvas.create_polygon(*pts, outline=CONTOUR_COLOR, fill="", width=2)
+
         if self.mask_bounds is not None:
             xL, yT, xR, yB = self.mask_bounds
-            self.canvas.create_rectangle(xL, yT, xR, yB, outline="yellow", width=2)
+            self.canvas.create_rectangle(xL * z, yT * z, xR * z, yB * z, outline=MASK_COLOR, width=2)
 
         if self.vline_coords is not None:
             x0, y0, y1 = self.vline_coords
-            self.canvas.create_line(x0, y0, x0, y1, fill="cyan", width=2)
-            y_mid = int((y0 + y1) / 2)
-            self.canvas.create_text(min(x0 + 8, self.widthScaled - 10), y_mid,
-                                    text=f"{self.vline_length_px} px",
-                                    fill="white", anchor="w",
-                                    font=("TkDefaultFont", 10, "bold"))
+            self.canvas.create_line(x0 * z, y0 * z, x0 * z, y1 * z, fill=VLINE_COLOR, width=1, dash=(4, 4))
 
+            # Each horizontal line uses the same color as its trace in the plot.
             ys, x_left, x_right = self._horizontal_rois_from_vline()
             for i, yk in enumerate(ys):
-                self.canvas.create_line(x_left, yk, x_right, yk, fill="cyan", width=2)
+                color = LINE_COLORS[i]
+                self.canvas.create_line(x_left * z, yk * z, x_right * z, yk * z, fill=color, width=3)
                 label = "" if np.isnan(hline_avgs[i]) else f"{hline_avgs[i]:.1f}°C"
-                self.canvas.create_text(min(x_right + 6, self.widthScaled - 2), yk,
-                                        text=label, fill="white", anchor="w",
-                                        font=("TkDefaultFont", 9, "bold"))
+                self._canvas_label(min(x_right * z + 8, self.widthScaled * z - 52), yk * z, label, color)
 
+        self._update_status(latest is not None)
         self.after_id = self.root.after(FRAME_DELAY_MS, self.update_video)
+
+    def _canvas_label(self, x, y, text, color):
+        # Text with a dark outline so it stays readable on any part of the colormap.
+        if not text:
+            return
+        font = (UI_FONT, 9, "bold")
+        for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            self.canvas.create_text(x + dx, y + dy, text=text, fill="#000000", anchor="w", font=font)
+        self.canvas.create_text(x, y, text=text, fill=color, anchor="w", font=font)
+
+    def toggle_recording(self):
+        if self.recording:
+            self.stop_recording()
+        else:
+            self.start_recording()
+        self._refresh_record_button()
 
     def start_recording(self):
         self.data_records = []
@@ -427,6 +665,9 @@ class ThermalVideoApp:
                 writer.writerow(header)
                 writer.writerows(self.data_records)
             print(f"Data saved to {path}")
+            self.record_info_var.set(f"Saved {len(self.data_records)} samples to {os.path.basename(path)}")
+        else:
+            self.record_info_var.set("Recording discarded")
         self.data_records = []
 
     def quit_app(self):
@@ -451,8 +692,9 @@ class ThermalVideoApp:
         pad = max(0.5, 0.05 * (hi - lo))
         return lo - pad, hi + pad
 
-    def _clamp_x(self, x): return max(0, min(self.widthScaled - 1, x))
-    def _clamp_y(self, y): return max(0, min(self.heightScaled - 1, y))
+    # Convert canvas (display) coordinates to processing-image coordinates.
+    def _clamp_x(self, x): return max(0, min(self.widthScaled - 1, int(x) // DISPLAY_ZOOM))
+    def _clamp_y(self, y): return max(0, min(self.heightScaled - 1, int(y) // DISPLAY_ZOOM))
 
 if __name__ == "__main__":
     root = tk.Tk()
