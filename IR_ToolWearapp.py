@@ -1,4 +1,4 @@
-import sys, os, time, platform
+import sys, os, time, platform, threading
 from collections import deque
 import cv2 as cv
 import numpy as np
@@ -47,6 +47,19 @@ TEMP_RANGES = {
 }
 DEFAULT_TEMP_RANGE = "High (-10°C to 400°C)"
 
+# ----- Camera connection indicator -----
+# FLIR part numbers reported by the camera (oem.GetFlirPartNumber) -> model name.
+# 500-0771-01 verified against this project's camera. Unknown part numbers fall
+# back to the sensor family implied by the frame size, and the P/N is still shown.
+KNOWN_LEPTON_PARTS = {
+    "500-0771-01": "Lepton 3.5",
+}
+LEPTON_FAMILY_BY_RES = {(160, 120): "Lepton 3.x", (80, 60): "Lepton 1.x / 2.x"}
+CAMERA_POLL_S     = 1.0   # how often the background thread pings the camera
+CAMERA_TIMEOUT_S  = 3.5   # no successful ping for this long -> "Not connected"
+VIDEO_TIMEOUT_S   = 2.0   # no frame for this long -> "No video"
+LED_COLORS = {"ok": "#22c55e", "warn": "#f59e0b", "off": "#ef4444"}
+
 CoInitialize()
 bits, _ = platform.architecture()
 sys.path.append(os.path.join("", "x64" if bits == "64bit" else "x86"))
@@ -61,14 +74,57 @@ if not found_device:
     sys.exit(1)
 
 lep = found_device.Open()
+# Serialises camera control calls between the UI and the connection monitor thread.
+CAMERA_LOCK = threading.Lock()
+
+def read_camera_info(device, cam):
+    """Collect whatever identifying metadata the camera reports; missing fields are skipped."""
+    info = {"board": device.Name}
+    try:
+        raw = cam.oem.GetFlirPartNumber().value
+        part = bytes(b & 0xFF for b in raw).split(b"\x00")[0].decode("ascii", "replace").strip()
+        if part:
+            info["part"] = part
+    except Exception:
+        pass
+    try:
+        info["serial"] = int(cam.sys.GetFlirSerialNumber())
+    except Exception:
+        pass
+    try:
+        cam.rad.GetTLinearEnableState()  # only radiometric Leptons support TLinear
+        info["radiometric"] = True
+    except Exception:
+        pass
+    return info
+
+def describe_camera(info, resolution=None):
+    """-> (model, details) for the header, e.g. ("Lepton 3.5", "P/N … · S/N … · PureThermal …")."""
+    model = KNOWN_LEPTON_PARTS.get(info.get("part"))
+    if model is None:
+        model = LEPTON_FAMILY_BY_RES.get(resolution, "Lepton (model not reported)")
+        if info.get("radiometric"):
+            model += " (radiometric)"
+    details = []
+    if "part" in info:
+        details.append(f"P/N {info['part']}")
+    if "serial" in info:
+        details.append(f"S/N {info['serial']}")
+    details.append(info["board"])
+    return model, "  ·  ".join(details)
+
+camera_info = read_camera_info(found_device, lep)
 
 clr.AddReference("ManagedIR16Filters")
 from IR16Filters import IR16Capture, NewBytesFrameEvent
 
 incoming_frames = deque(maxlen=10)
+last_frame_time = 0.0  # wall-clock time the last camera frame arrived
 
 def got_a_frame(frame, width, height):
+    global last_frame_time
     incoming_frames.append((height, width, frame))
+    last_frame_time = time.time()
 
 capture = IR16Capture()
 capture.SetupGraphWithBytesCallback(NewBytesFrameEvent(got_a_frame))
@@ -123,7 +179,9 @@ class ThermalVideoApp:
         if incoming_frames:
             h, w, f = incoming_frames[-1]
             preview = short_array_to_numpy(h, w, f)
+            self.sensor_res = (w, h)
         else:
+            self.sensor_res = None
             preview = np.zeros((240, 320), np.uint16)
 
         self.widthScaled  = int(preview.shape[1] * SCALE_PERCENT / 100)
@@ -142,7 +200,61 @@ class ThermalVideoApp:
         self._use_dark_titlebar()
         self.change_temp_range()
 
+        self._start_camera_monitor()
+        self._refresh_camera_led()
         self.update_video()
+
+    # ----- Camera connection monitor -----
+    def _start_camera_monitor(self):
+        """Ping the camera from a background thread so a hung or unplugged camera
+        never freezes the UI. The UI reads only the timestamp of the last good ping."""
+        self._last_ping_ok = time.time()
+
+        def ping():
+            global lep
+            if not CAMERA_LOCK.acquire(timeout=1):
+                return False
+            try:
+                lep.sys.GetCameraUpTime()
+                return True
+            except Exception:
+                # Handle may be stale after an unplug/replug: try to reopen the camera.
+                try:
+                    dev = next((d for d in CCI.GetDevices() if d.Name.startswith("PureThermal")), None)
+                    if dev is None:
+                        return False
+                    cam = dev.Open()
+                    cam.sys.GetCameraUpTime()
+                    lep = cam
+                    return True
+                except Exception:
+                    return False
+            finally:
+                CAMERA_LOCK.release()
+
+        def run():
+            CoInitialize()  # COM is per-thread
+            while self.running:
+                if ping():
+                    self._last_ping_ok = time.time()
+                time.sleep(CAMERA_POLL_S)
+
+        threading.Thread(target=run, name="camera-monitor", daemon=True).start()
+
+    def _refresh_camera_led(self):
+        if not self.running:
+            return
+        now = time.time()
+        if now - self._last_ping_ok > CAMERA_TIMEOUT_S:
+            state, text = "off", "Not connected"
+        elif now - last_frame_time > VIDEO_TIMEOUT_S:
+            state, text = "warn", "Connected · no video"
+        else:
+            state, text = "ok", "Connected"
+        self.led.itemconfigure(self.led_dot, fill=LED_COLORS[state])
+        self.cam_status_var.set(text)
+        self.camera_state = state
+        self.root.after(500, self._refresh_camera_led)
 
     # ----- Look & layout -----
     def _build_style(self):
@@ -159,6 +271,8 @@ class ThermalVideoApp:
         style.configure("Title.TLabel", font=(UI_FONT, 15, "bold"))
         style.configure("Subtitle.TLabel", foreground=T["muted"], font=(UI_FONT, 9))
         style.configure("Footer.TLabel", foreground=T["muted"], font=(UI_FONT, 9))
+        style.configure("CamStatus.TLabel", foreground=T["text"], font=(UI_FONT, 9, "bold"))
+        style.configure("CamModel.TLabel", foreground=T["text"], font=(UI_FONT, 9))
         style.configure("Side.TLabel", background=T["panel"], foreground=T["text"])
         style.configure("Section.TLabel", background=T["panel"], foreground=T["muted"],
                         font=(UI_FONT, 8, "bold"))
@@ -206,8 +320,17 @@ class ThermalVideoApp:
         header.grid(row=0, column=0, columnspan=3, sticky="ew")
         header.columnconfigure(1, weight=1)
         ttk.Label(header, text="Tool Wear IR Monitor", style="Title.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Label(header, text=f"{found_device.Name}  ·  Lepton 3.5",
-                  style="Subtitle.TLabel").grid(row=1, column=0, sticky="w")
+        # Camera connection LED + status + model details from the camera's metadata
+        cam_row = ttk.Frame(header)
+        cam_row.grid(row=1, column=0, sticky="w", pady=(2, 0))
+        self.led = tk.Canvas(cam_row, width=12, height=12, bg=T["bg"], highlightthickness=0, bd=0)
+        self.led.grid(row=0, column=0, padx=(1, 6))
+        self.led_dot = self.led.create_oval(1, 1, 11, 11, fill=LED_COLORS["warn"], outline="")
+        self.cam_status_var = tk.StringVar(value="Checking camera…")
+        ttk.Label(cam_row, textvariable=self.cam_status_var, style="CamStatus.TLabel").grid(row=0, column=1)
+        self.cam_model, cam_details = describe_camera(camera_info, self.sensor_res)
+        ttk.Label(cam_row, text=f"{self.cam_model}", style="CamModel.TLabel").grid(row=0, column=2, padx=(10, 0))
+        ttk.Label(cam_row, text=f"·  {cam_details}", style="Subtitle.TLabel").grid(row=0, column=3, padx=(8, 0))
         self.status_pill = tk.Label(header, text="", font=(UI_FONT, 9, "bold"), padx=12, pady=4)
         self.status_pill.grid(row=0, column=2, rowspan=2, sticky="e")
 
@@ -500,12 +623,17 @@ class ThermalVideoApp:
         selected = self.temp_range_var.get()
         if selected in TEMP_RANGES:
             gain_name = TEMP_RANGES[selected]
+            if not CAMERA_LOCK.acquire(timeout=2):
+                print("Failed to set temperature range: camera busy or not responding")
+                return
             try:
                 lep.sys.SetGainMode(getattr(CCI.Sys.GainMode, gain_name))
                 actual = lep.sys.GetGainMode()
                 print(f"Temperature range set to: {selected} (gain mode {actual})")
             except Exception as e:
                 print(f"Failed to set temperature range: {e}")
+            finally:
+                CAMERA_LOCK.release()
 
     # ----- Horizontal ROI helpers -----
     def _horizontal_rois_from_vline(self):
