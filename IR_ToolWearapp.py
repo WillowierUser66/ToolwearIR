@@ -17,6 +17,8 @@ PLOT_WINDOW_S   = 10     # seconds of history visible in the live plots
 PLOT_HISTORY_LEN = 300   # points kept for plotting (~30 s at the Lepton's ~9 fps)
 # Order matches _horizontal_rois_from_vline() and the CSV columns
 HLINE_LABELS    = ["Line 1", "Line 2", "Line 3", "Line 4", "Baseline"]
+# Total length of each horizontal line in image px (slider range; default = original 20 px)
+HLINE_LEN_MIN, HLINE_LEN_MAX, HLINE_LEN_DEFAULT = 4, 80, 20
 
 # ----- UI theme -----
 UI_FONT = "Segoe UI" if sys.platform == "win32" else "Helvetica"
@@ -106,6 +108,7 @@ class ThermalVideoApp:
 
         self.vline_coords = None   # (x, y0, y1)
         self.vline_length_px = 0
+        self.hline_len_px = HLINE_LEN_DEFAULT  # total length of each horizontal line
         self._line_drag_start = None
         self._line_rubberband_id = None
 
@@ -158,6 +161,11 @@ class ThermalVideoApp:
         style.configure("Value.TLabel", background=T["panel"], foreground=T["text"],
                         font=(UI_FONT, 15, "bold"))
         style.configure("TSeparator", background=T["border"])
+        style.configure("Horizontal.TScale", background=T["accent"], troughcolor=T["card"],
+                        bordercolor=T["border"], lightcolor=T["card"], darkcolor=T["card"],
+                        sliderthickness=14, gripcount=0,
+                        padding=0, focusthickness=0)  # else the accent bg shows as a ring
+        style.map("Horizontal.TScale", background=[("active", T["accent_hover"])])
 
         def button(name, bg, hover, fg="#ffffff"):
             style.configure(name, background=bg, foreground=fg, padding=(12, 8),
@@ -224,6 +232,17 @@ class ThermalVideoApp:
         self.line_length_var = tk.StringVar(value="No line drawn")
         ttk.Label(side, textvariable=self.line_length_var, style="SideMuted.TLabel").grid(
             row=r, column=0, columnspan=2, sticky="w", pady=(6, 0)); r += 1
+
+        # Slider: total length of each horizontal line (image px), centred on the vertical line
+        ttk.Label(side, text="Horizontal line length", style="SideMuted.TLabel").grid(
+            row=r, column=0, sticky="w", pady=(10, 0))
+        self.hline_len_label = tk.StringVar(value=f"{self.hline_len_px} px")
+        ttk.Label(side, textvariable=self.hline_len_label, style="Side.TLabel").grid(
+            row=r, column=1, sticky="e", pady=(10, 0)); r += 1
+        self.hline_len_var = tk.IntVar(value=self.hline_len_px)
+        ttk.Scale(side, from_=HLINE_LEN_MIN, to=HLINE_LEN_MAX, orient="horizontal",
+                  variable=self.hline_len_var, command=self._on_hline_len).grid(
+            row=r, column=0, columnspan=2, sticky="ew", pady=(2, 0)); r += 1
 
         section("Camera range")
         self.temp_range_var = tk.StringVar(value=DEFAULT_TEMP_RANGE)
@@ -438,6 +457,13 @@ class ThermalVideoApp:
         self.vline_coords = None; self.vline_length_px = 0
         self.line_length_var.set("No line drawn")
 
+    def _on_hline_len(self, value):
+        # Snap to even values so the line stays centred on the vertical line.
+        length = int(round(float(value) / 2)) * 2
+        length = max(HLINE_LEN_MIN, min(HLINE_LEN_MAX, length))
+        self.hline_len_px = length
+        self.hline_len_label.set(f"{length} px")
+
     def _unbind_all_draw(self):
         for seq in ("<ButtonPress-1>", "<B1-Motion>", "<ButtonRelease-1>"):
             self.canvas.unbind(seq)
@@ -481,7 +507,7 @@ class ThermalVideoApp:
         # Clamp to canvas bounds
         ys = [max(0, min(self.heightScaled - 1, yk)) for yk in ys]
 
-        half_len = 10  # total 20 px line length
+        half_len = self.hline_len_px // 2  # set by the "Horizontal line length" slider
         x_left = max(0, x0 - half_len)
         x_right = min(self.widthScaled - 1, x0 + half_len)
         return ys, x_left, x_right
