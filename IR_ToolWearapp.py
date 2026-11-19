@@ -33,7 +33,9 @@ LINE_COLORS = ["#60a5fa", "#fbbf24", "#34d399", "#f472b6", "#a78bfa"]  # Line 1-
 MAX_COLOR   = "#fb923c"
 MASK_COLOR  = "#facc15"
 CONTOUR_COLOR = "#4ade80"
-DISPLAY_ZOOM = 2   # on-screen enlargement only; processing/CSV stay at SCALE_PERCENT
+LEGEND_ONE_ROW_MIN_W = 420  # plot width (px) needed to fit the 5-entry legend on one row
+DISPLAY_ZOOM = 2   # initial on-screen enlargement; it then follows the window size.
+                   # Display only: processing and CSV values stay at SCALE_PERCENT.
 VLINE_COLOR = "#e5e7eb"
 HINT_IDLE   = "Draw a mask around the endmill, then a vertical line along it for the temperature profile."
 
@@ -113,6 +115,10 @@ class ThermalVideoApp:
         self._line_rubberband_id = None
 
         self._frame_times = deque(maxlen=20)  # for the fps readout
+        # Display transform: canvas = image * zoom + offset (updated on resize)
+        self.zoom = float(DISPLAY_ZOOM)
+        self.ox = self.oy = 0.0
+        self._last_draw = None  # (frame_bgr, contour, line temps) for repaints
 
         if incoming_frames:
             h, w, f = incoming_frames[-1]
@@ -276,41 +282,45 @@ class ThermalVideoApp:
             row=r, column=0, columnspan=2, sticky="ew")
 
         # Video card
+        # The canvas fills its card; the image is scaled to fit and centred
+        # (see _on_canvas_resize), so it grows and shrinks with the window.
         video_card = ttk.Frame(root, style="Card.TFrame", padding=8)
-        video_card.grid(row=1, column=1, sticky="n", padx=8, pady=8)
+        video_card.grid(row=1, column=1, sticky="nsew", padx=8, pady=8)
         self.canvas = tk.Canvas(video_card, width=self.widthScaled * DISPLAY_ZOOM,
                                 height=self.heightScaled * DISPLAY_ZOOM,
-                                bg="#000000", highlightthickness=0, bd=0)
-        self.canvas.pack()
+                                bg=T["card"], highlightthickness=0, bd=0)
+        self.canvas.pack(fill="both", expand=True)
+        self.canvas.bind("<Configure>", self._on_canvas_resize)
 
-        # Plot cards
+        # Plot cards share the column height equally and stretch with it
         plots = ttk.Frame(root)
-        plots.grid(row=1, column=2, sticky="n", padx=(8, 16), pady=8)
+        plots.grid(row=1, column=2, sticky="nsew", padx=(8, 16), pady=8)
+        plots.columnconfigure(0, weight=1)
+        plots.rowconfigure(0, weight=1); plots.rowconfigure(1, weight=1)
 
         def plot_card(row, title, pady):
             card = ttk.Frame(plots, style="Card.TFrame", padding=4)
-            card.grid(row=row, column=0, pady=pady)
+            card.grid(row=row, column=0, pady=pady, sticky="nsew")
             fig, ax = plt.subplots(figsize=(4.6, 2.32), dpi=100)
             self._style_axes(fig, ax, title)
             canvas = FigureCanvasTkAgg(fig, master=card)
             canvas.get_tk_widget().configure(bg=T["card"], highlightthickness=0)
-            canvas.get_tk_widget().pack()
+            canvas.get_tk_widget().pack(fill="both", expand=True)
             return fig, ax, canvas
 
         self.fig_lines, self.ax_lines, self.canvas_lines = plot_card(0, "Horizontal line temperatures", (0, 8))
         self.hline_plots = [self.ax_lines.plot([], [], label=lbl, color=c, linewidth=1.6)[0]
                             for lbl, c in zip(HLINE_LABELS, LINE_COLORS)]
-        self.ax_lines.set_title(self.ax_lines.get_title("left"), loc="left", color=T["text"],
-                                fontsize=10, fontweight="bold", pad=20)
-        # Legend sits between the title and the plot area so it never covers traces.
-        self.ax_lines.legend(loc="lower left", bbox_to_anchor=(0, 1.0), borderaxespad=0.2,
-                             fontsize=7, ncol=5, frameon=False, labelcolor=T["text"],
-                             handlelength=1.2, columnspacing=1.0)
-        self.fig_lines.tight_layout(pad=0.8)
+        self._legend_ncol = None
+        self._fit_legend(5)
+        self.canvas_lines.get_tk_widget().bind(
+            "<Configure>", lambda e: self._fit_legend(5 if e.width >= LEGEND_ONE_ROW_MIN_W else 3), add="+")
+        # A layout engine re-fits margins on every draw, so plots stay tidy at any size.
+        self.fig_lines.set_layout_engine("tight", pad=0.8)
 
         self.fig_max, self.ax_max, self.canvas_max = plot_card(1, "Edge ROI maximum temperature", 0)
         self.line_max, = self.ax_max.plot([], [], color=MAX_COLOR, linewidth=1.6)
-        self.fig_max.tight_layout(pad=0.8)
+        self.fig_max.set_layout_engine("tight", pad=0.8)
 
         # Footer: drawing hints + fps
         footer = ttk.Frame(root, padding=(16, 0, 16, 10))
@@ -321,7 +331,26 @@ class ThermalVideoApp:
         self.fps_var = tk.StringVar(value="")
         ttk.Label(footer, textvariable=self.fps_var, style="Footer.TLabel").grid(row=0, column=1, sticky="e")
 
-        root.resizable(False, False)
+        # Video and plots take the extra space; the sidebar keeps its width.
+        root.columnconfigure(1, weight=3)
+        root.columnconfigure(2, weight=2)
+        root.rowconfigure(1, weight=1)
+        root.update_idletasks()
+        root.minsize(min(root.winfo_reqwidth(), 1000), min(root.winfo_reqheight(), 560))
+
+    def _fit_legend(self, ncol):
+        """Line-plot legend sits between the title and the axes so it never covers
+        traces; it wraps to 2 rows when the plot is too narrow for one."""
+        if ncol == self._legend_ncol:
+            return
+        self._legend_ncol = ncol
+        T = THEME
+        rows = -(-len(HLINE_LABELS) // ncol)
+        self.ax_lines.set_title(self.ax_lines.get_title("left"), loc="left", color=T["text"],
+                                fontsize=10, fontweight="bold", pad=8 + 12 * rows)
+        self.ax_lines.legend(loc="lower left", bbox_to_anchor=(0, 1.0), borderaxespad=0.2,
+                             fontsize=7, ncol=ncol, frameon=False, labelcolor=T["text"],
+                             handlelength=1.2, columnspacing=1.0)
 
     @staticmethod
     def _style_axes(fig, ax, title):
@@ -393,13 +422,13 @@ class ThermalVideoApp:
         if not self._drag_start: return
         x0, y0 = self._drag_start
         x1, y1 = self._clamp_x(event.x), self._clamp_y(event.y)
-        z = DISPLAY_ZOOM
+        coords = (*self._to_canvas(x0, y0), *self._to_canvas(x1, y1))
         if self._rubberband_id is None:
             self._rubberband_id = self.canvas.create_rectangle(
-                x0 * z, y0 * z, x1 * z, y1 * z, outline=MASK_COLOR, width=2, dash=(4, 3)
+                *coords, outline=MASK_COLOR, width=2, dash=(4, 3)
             )
         else:
-            self.canvas.coords(self._rubberband_id, x0 * z, y0 * z, x1 * z, y1 * z)
+            self.canvas.coords(self._rubberband_id, *coords)
 
     def _on_mask_release(self, event):
         if not self._drag_start: return
@@ -430,16 +459,15 @@ class ThermalVideoApp:
         self._line_drag_start = (x0, y0)
         if self._line_rubberband_id is not None:
             self.canvas.delete(self._line_rubberband_id); self._line_rubberband_id = None
-        z = DISPLAY_ZOOM
-        self._line_rubberband_id = self.canvas.create_line(x0 * z, y0 * z, x0 * z, y0 * z,
-                                                           fill=VLINE_COLOR, width=2)
+        cx, cy = self._to_canvas(x0, y0)
+        self._line_rubberband_id = self.canvas.create_line(cx, cy, cx, cy, fill=VLINE_COLOR, width=2)
 
     def _on_line_drag(self, event):
         if not self._line_drag_start or self._line_rubberband_id is None: return
         x0, y0 = self._line_drag_start
         y1 = self._clamp_y(event.y)
-        z = DISPLAY_ZOOM
-        self.canvas.coords(self._line_rubberband_id, x0 * z, y0 * z, x0 * z, y1 * z)
+        self.canvas.coords(self._line_rubberband_id,
+                           *self._to_canvas(x0, y0), *self._to_canvas(x0, y1))
 
     def _on_line_release(self, event):
         if not self._line_drag_start: return
@@ -610,39 +638,51 @@ class ThermalVideoApp:
         self.ax_max.set_ylim(*self._padded_ylim(mx[visible]))
         self.canvas_max.draw()
 
-        # Draw on Tk canvas. Processing happens at widthScaled x heightScaled;
-        # the display is enlarged by DISPLAY_ZOOM, so overlay coords are scaled by z.
-        z = DISPLAY_ZOOM
-        display = cv.resize(frame_bgr, (self.widthScaled * z, self.heightScaled * z),
-                            interpolation=cv.INTER_LINEAR)
+        self._last_draw = (frame_bgr, largest, hline_avgs)
+        self._draw_video()
+        self._update_status(latest is not None)
+        self.after_id = self.root.after(FRAME_DELAY_MS, self.update_video)
+
+    def _draw_video(self):
+        """Paint the last processed frame and overlays. Called per new frame and on
+        resize; it never touches recording or plot history, so resizing adds no rows."""
+        if self._last_draw is None:
+            return
+        frame_bgr, largest, hline_avgs = self._last_draw
+        # Processing happens at widthScaled x heightScaled; the display is scaled
+        # by self.zoom and centred (self.ox, self.oy) to fit the canvas.
+        disp_w = max(1, int(round(self.widthScaled * self.zoom)))
+        disp_h = max(1, int(round(self.heightScaled * self.zoom)))
+        display = cv.resize(frame_bgr, (disp_w, disp_h), interpolation=cv.INTER_LINEAR)
         rgb = cv.cvtColor(display, cv.COLOR_BGR2RGB)
         imgtk = ImageTk.PhotoImage(Image.fromarray(rgb))
         self.canvas.delete("all")
-        self.canvas.create_image(0, 0, anchor=tk.NW, image=imgtk)
+        self.canvas.create_image(int(self.ox), int(self.oy), anchor=tk.NW, image=imgtk)
         self.canvas.imgtk = imgtk
 
         if largest is not None and len(largest) > 1:
-            pts = (largest.reshape(-1, 2) * z + z // 2).ravel().tolist()
-            self.canvas.create_polygon(*pts, outline=CONTOUR_COLOR, fill="", width=2)
+            pts = (largest.reshape(-1, 2) + 0.5) * self.zoom + (self.ox, self.oy)
+            self.canvas.create_polygon(*pts.ravel().tolist(), outline=CONTOUR_COLOR, fill="", width=2)
 
         if self.mask_bounds is not None:
             xL, yT, xR, yB = self.mask_bounds
-            self.canvas.create_rectangle(xL * z, yT * z, xR * z, yB * z, outline=MASK_COLOR, width=2)
+            self.canvas.create_rectangle(*self._to_canvas(xL, yT), *self._to_canvas(xR, yB),
+                                         outline=MASK_COLOR, width=2)
 
         if self.vline_coords is not None:
             x0, y0, y1 = self.vline_coords
-            self.canvas.create_line(x0 * z, y0 * z, x0 * z, y1 * z, fill=VLINE_COLOR, width=1, dash=(4, 4))
+            self.canvas.create_line(*self._to_canvas(x0, y0), *self._to_canvas(x0, y1),
+                                    fill=VLINE_COLOR, width=1, dash=(4, 4))
 
             # Each horizontal line uses the same color as its trace in the plot.
             ys, x_left, x_right = self._horizontal_rois_from_vline()
+            right_edge = self.ox + disp_w
             for i, yk in enumerate(ys):
                 color = LINE_COLORS[i]
-                self.canvas.create_line(x_left * z, yk * z, x_right * z, yk * z, fill=color, width=3)
+                (lx, cy), (rx, _) = self._to_canvas(x_left, yk), self._to_canvas(x_right, yk)
+                self.canvas.create_line(lx, cy, rx, cy, fill=color, width=3)
                 label = "" if np.isnan(hline_avgs[i]) else f"{hline_avgs[i]:.1f}°C"
-                self._canvas_label(min(x_right * z + 8, self.widthScaled * z - 52), yk * z, label, color)
-
-        self._update_status(latest is not None)
-        self.after_id = self.root.after(FRAME_DELAY_MS, self.update_video)
+                self._canvas_label(min(rx + 8, right_edge - 52), cy, label, color)
 
     def _canvas_label(self, x, y, text, color):
         # Text with a dark outline so it stays readable on any part of the colormap.
@@ -718,9 +758,20 @@ class ThermalVideoApp:
         pad = max(0.5, 0.05 * (hi - lo))
         return lo - pad, hi + pad
 
+    # ----- Display transform (image px <-> canvas px) -----
+    def _on_canvas_resize(self, event):
+        # Fit the image inside the canvas, keeping its aspect ratio, and centre it.
+        self.zoom = max(0.1, min(event.width / self.widthScaled, event.height / self.heightScaled))
+        self.ox = (event.width - self.widthScaled * self.zoom) / 2
+        self.oy = (event.height - self.heightScaled * self.zoom) / 2
+        self._draw_video()  # repaint at the new size right away
+
+    def _to_canvas(self, x, y):
+        return x * self.zoom + self.ox, y * self.zoom + self.oy
+
     # Convert canvas (display) coordinates to processing-image coordinates.
-    def _clamp_x(self, x): return max(0, min(self.widthScaled - 1, int(x) // DISPLAY_ZOOM))
-    def _clamp_y(self, y): return max(0, min(self.heightScaled - 1, int(y) // DISPLAY_ZOOM))
+    def _clamp_x(self, x): return max(0, min(self.widthScaled - 1, int((x - self.ox) / self.zoom)))
+    def _clamp_y(self, y): return max(0, min(self.heightScaled - 1, int((y - self.oy) / self.zoom)))
 
 if __name__ == "__main__":
     root = tk.Tk()
